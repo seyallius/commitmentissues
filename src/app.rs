@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context, Result};
 use chrono::Local;
 use crossterm::{
-    event::{Event, EventStream, KeyEventKind, MouseButton, MouseEventKind},
+    event::{Event, EventStream, KeyEventKind, MouseEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -64,6 +64,10 @@ async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
         show_help: false,
         git_commits: Vec::new(),
         git_status: "Loading Git context…".into(),
+        click_targets: Vec::new(),
+        context_menu: None,
+        last_row_click: None,
+        delete_confirmation: None,
     };
     ui.refresh_git();
     let mut events = EventStream::new();
@@ -80,10 +84,8 @@ async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => { if handle_key(&mut ui, key.code) { break Ok(()); } },
                 Some(Ok(Event::Mouse(mouse))) => match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if ui.show_help { ui.show_help = false; }
-                        else if let Some((_, index)) = ui.button_areas.iter().find(|(area, _)| area.contains(Position::new(mouse.column, mouse.row))) { ui.activate(*index); }
-                        else if let Some((_, index)) = ui.task_rows.iter().find(|(area, _)| area.contains(Position::new(mouse.column, mouse.row))) { ui.selected = *index; }
+                    MouseEventKind::Down(button) => {
+                        if ui.handle_mouse(button, Position::new(mouse.column, mouse.row)) { break Ok(()); }
                     },
                     MouseEventKind::ScrollDown => ui.step_selection(1),
                     MouseEventKind::ScrollUp => ui.step_selection(-1),

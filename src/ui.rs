@@ -3,14 +3,19 @@ use crate::{
     git::{collect_commits, new_session},
 };
 use chrono::{Local, NaiveDate};
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, MouseButton};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState},
 };
-use std::{collections::HashSet, fs, path::PathBuf};
+use std::{
+    collections::HashSet,
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 pub(crate) struct Ui {
@@ -28,9 +33,179 @@ pub(crate) struct Ui {
     pub(crate) show_help: bool,
     pub(crate) git_commits: Vec<Commit>,
     pub(crate) git_status: String,
+    pub(crate) click_targets: Vec<(Rect, ClickAction)>,
+    pub(crate) context_menu: Option<(usize, u16, u16)>,
+    pub(crate) last_row_click: Option<(usize, Instant)>,
+    pub(crate) delete_confirmation: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ClickAction {
+    PreviousDay,
+    NextDay,
+    NewTask,
+    ToggleArchived,
+    NextTheme,
+    Help,
+    Quit,
+    SelectTask(usize),
+    ActivateTask(usize),
+    RenameTask(usize),
+    ToggleTaskArchive(usize),
+    DeleteTask(usize),
+    DeleteConfirm(usize),
+    DeleteCancel,
+    SaveInput,
+    CancelInput,
+    CloseHelp,
+    CloseContext,
 }
 
 impl Ui {
+    pub(crate) fn handle_mouse(&mut self, button: MouseButton, point: Position) -> bool {
+        if button == MouseButton::Right {
+            if let Some((_, task_index)) =
+                self.task_rows.iter().find(|(rect, _)| rect.contains(point))
+            {
+                self.selected = *task_index;
+                self.context_menu = Some((*task_index, point.x, point.y));
+                return false;
+            }
+            self.context_menu = None;
+            return false;
+        }
+        if button != MouseButton::Left {
+            return false;
+        }
+        if let Some((_, action)) = self
+            .click_targets
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(point))
+        {
+            return self.perform_click(*action);
+        }
+        self.context_menu = None;
+        false
+    }
+
+    fn perform_click(&mut self, action: ClickAction) -> bool {
+        if !matches!(
+            action,
+            ClickAction::RenameTask(_)
+                | ClickAction::ToggleTaskArchive(_)
+                | ClickAction::DeleteTask(_)
+                | ClickAction::DeleteConfirm(_)
+                | ClickAction::DeleteCancel
+                | ClickAction::CloseContext
+        ) {
+            self.context_menu = None;
+        }
+        match action {
+            ClickAction::PreviousDay => {
+                self.day = self.day.pred_opt().unwrap_or(self.day);
+                self.refresh_git();
+            }
+            ClickAction::NextDay => {
+                self.day = self.day.succ_opt().unwrap_or(self.day);
+                self.refresh_git();
+            }
+            ClickAction::NewTask => self.input = Some(("New task".into(), String::new())),
+            ClickAction::ToggleArchived => {
+                self.show_archived = !self.show_archived;
+            }
+            ClickAction::NextTheme => {
+                self.theme = (self.theme + 1) % 5;
+                self.save_theme();
+                self.status = format!("Theme: {}", palette_name(self.theme));
+            }
+            ClickAction::Help => self.show_help = true,
+            ClickAction::Quit => return true,
+            ClickAction::SelectTask(index) => {
+                self.selected = index;
+                let now = Instant::now();
+                if self.last_row_click.is_some_and(|(previous, at)| {
+                    previous == index && now.duration_since(at) <= Duration::from_millis(450)
+                }) {
+                    self.input = Some(("Rename task".into(), self.data.tasks[index].name.clone()));
+                    self.last_row_click = None;
+                } else {
+                    self.last_row_click = Some((index, now));
+                }
+            }
+            ClickAction::ActivateTask(index) => self.activate(index),
+            ClickAction::RenameTask(index) => {
+                self.selected = index;
+                self.context_menu = None;
+                self.input = Some(("Rename task".into(), self.data.tasks[index].name.clone()))
+            }
+            ClickAction::ToggleTaskArchive(index) => {
+                self.data.tasks[index].archived = !self.data.tasks[index].archived;
+                self.persist();
+                self.context_menu = None;
+            }
+            ClickAction::DeleteTask(index) => {
+                self.delete_confirmation = Some(index);
+                self.context_menu = None;
+            }
+            ClickAction::DeleteConfirm(index) => {
+                if self.data.running().is_some_and(|running| {
+                    self.data.sessions[running].task_id == self.data.tasks[index].id
+                }) {
+                    self.status = "Stop the task before deleting it".into();
+                } else {
+                    let task_id = self.data.tasks[index].id.clone();
+                    self.data
+                        .sessions
+                        .retain(|session| session.task_id != task_id);
+                    self.data.tasks.remove(index);
+                    self.selected = self.selected.min(self.data.tasks.len().saturating_sub(1));
+                    self.persist();
+                    self.status = "Task and its recorded sessions deleted".into();
+                }
+                self.delete_confirmation = None;
+            }
+            ClickAction::DeleteCancel => self.delete_confirmation = None,
+            ClickAction::SaveInput => self.save_input(),
+            ClickAction::CancelInput => {
+                self.input = None;
+                self.status = "Cancelled".into();
+            }
+            ClickAction::CloseHelp => self.show_help = false,
+            ClickAction::CloseContext => self.context_menu = None,
+        }
+        false
+    }
+
+    fn save_input(&mut self) {
+        let Some((prompt, value)) = self.input.take() else {
+            return;
+        };
+        if value.trim().is_empty() {
+            self.status = "Name cannot be empty".into();
+            return;
+        }
+        match prompt.as_str() {
+            "New task" => {
+                self.data.tasks.push(Task {
+                    id: Uuid::new_v4().simple().to_string(),
+                    name: value.trim().into(),
+                    short_id: String::new(),
+                    archived: false,
+                });
+                self.selected = self.data.tasks.len() - 1;
+                self.persist();
+                self.status = "Task created".into();
+            }
+            "Rename task" if self.selected < self.data.tasks.len() => {
+                self.data.tasks[self.selected].name = value.trim().into();
+                self.persist();
+                self.status = "Task renamed".into();
+            }
+            _ => self.status = "Unknown action".into(),
+        }
+    }
+
     pub(crate) fn step_selection(&mut self, direction: isize) {
         let tasks = self.tasks();
         if tasks.is_empty() {
@@ -313,6 +488,7 @@ fn palette_name(theme: usize) -> &'static str {
 pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
     let area = frame.area();
     let colors = palette(ui.theme);
+    ui.click_targets.clear();
     if area.width < 30 || area.height < 8 {
         frame.render_widget(
             Paragraph::new("Resize terminal to at least 30 × 8")
@@ -370,24 +546,53 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
             .border_style(Style::default().fg(colors.border)),
     );
     frame.render_widget(title, layout[0]);
-    let status = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " TODAY  ",
-            Style::default()
-                .bg(colors.accent)
-                .fg(colors.background)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" {} ", ui.day.format("%A, %B %-d, %Y")),
-            Style::default().fg(colors.text),
-        ),
-        Span::styled(
-            format!("          {}", ui.status),
-            Style::default().fg(colors.muted),
-        ),
-    ]));
-    frame.render_widget(status, layout[1]);
+    let date_controls = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Length(28),
+            Constraint::Length(5),
+            Constraint::Min(8),
+        ])
+        .split(layout[1]);
+    draw_button(
+        frame,
+        ui,
+        date_controls[0],
+        "‹ Prev",
+        colors,
+        ClickAction::PreviousDay,
+        false,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " TODAY  ",
+                Style::default()
+                    .bg(colors.accent)
+                    .fg(colors.background)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} ", ui.day.format("%a, %b %-d, %Y")),
+                Style::default().fg(colors.text),
+            ),
+        ])),
+        date_controls[1],
+    );
+    draw_button(
+        frame,
+        ui,
+        date_controls[2],
+        "Next ›",
+        colors,
+        ClickAction::NextDay,
+        false,
+    );
+    frame.render_widget(
+        Paragraph::new(ui.status.as_str()).style(Style::default().fg(colors.muted)),
+        date_controls[3],
+    );
     let split = if area.width >= 112 {
         Layout::default()
             .direction(Direction::Horizontal)
@@ -404,34 +609,35 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
     ui.task_rows.clear();
     render_tasks(frame, ui, split[0], colors);
     render_report(frame, ui, split[1], colors);
-    let footer = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " n ",
-            Style::default()
-                .fg(colors.accent)
-                .add_modifier(Modifier::BOLD),
+    let footer_buttons = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(20); 5])
+        .split(layout[3]);
+    for (area, (label, action)) in footer_buttons.iter().copied().zip([
+        ("＋ New task", ClickAction::NewTask),
+        (
+            if ui.show_archived {
+                "◉ Hide archived"
+            } else {
+                "◯ Show archived"
+            },
+            ClickAction::ToggleArchived,
         ),
-        Span::raw("new   "),
-        Span::styled("Enter", Style::default().fg(colors.accent)),
-        Span::raw(" start/stop   "),
-        Span::styled("← →", Style::default().fg(colors.accent)),
-        Span::raw(" day   "),
-        Span::styled(
-            format!("t {}", palette_name(ui.theme)),
-            Style::default().fg(colors.accent),
-        ),
-        Span::raw(" themes   "),
-        Span::styled("?", Style::default().fg(colors.accent)),
-        Span::raw(" help   "),
-        Span::styled("q", Style::default().fg(colors.accent)),
-        Span::raw(" quit   ·   Mouse enabled"),
-    ]))
-    .style(Style::default().fg(colors.muted));
-    frame.render_widget(footer, layout[3]);
-    if let Some((prompt, value)) = &ui.input {
-        render_input(frame, prompt, value, colors);
+        ("◈ Theme", ClickAction::NextTheme),
+        ("? Help", ClickAction::Help),
+        ("× Quit", ClickAction::Quit),
+    ]) {
+        draw_button(frame, ui, area, label, colors, action, true);
+    }
+    if let Some((task_index, x, y)) = ui.context_menu {
+        render_context_menu(frame, ui, colors, task_index, x, y);
+    }
+    if let Some((prompt, value)) = ui.input.clone() {
+        render_input(frame, ui, &prompt, &value, colors);
+    } else if let Some(index) = ui.delete_confirmation {
+        render_delete_confirmation(frame, ui, colors, index);
     } else if ui.show_help {
-        render_help(frame, colors);
+        render_help(frame, ui, colors);
     }
 }
 
@@ -499,9 +705,16 @@ fn render_tasks(frame: &mut ratatui::Frame, ui: &mut Ui, area: Rect, colors: Pal
         .height(1);
         rows.push(row);
         let row_y = area.y + 2 + (index - offset) as u16;
-        ui.button_areas.push((
-            Rect::new(area.x + area.width.saturating_sub(13), row_y, 12, 1),
-            *task_index,
+        let action_x = area.x + 1 + area.width.saturating_sub(2) * 42 / 100 + 22;
+        ui.button_areas
+            .push((Rect::new(action_x, row_y, 12, 1), *task_index));
+        ui.click_targets.push((
+            Rect::new(area.x + 1, row_y, area.width.saturating_sub(2), 1),
+            ClickAction::SelectTask(*task_index),
+        ));
+        ui.click_targets.push((
+            Rect::new(action_x, row_y, 12, 1),
+            ClickAction::ActivateTask(*task_index),
         ));
         ui.task_rows.push((
             Rect::new(area.x + 1, row_y, area.width.saturating_sub(2), 1),
@@ -712,7 +925,95 @@ fn render_report(frame: &mut ratatui::Frame, ui: &Ui, area: Rect, colors: Palett
     );
 }
 
-fn render_input(frame: &mut ratatui::Frame, prompt: &str, value: &str, colors: Palette) {
+fn draw_button(
+    frame: &mut ratatui::Frame,
+    ui: &mut Ui,
+    area: Rect,
+    label: &str,
+    colors: Palette,
+    action: ClickAction,
+    bordered: bool,
+) {
+    let widget = Paragraph::new(label)
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(Style::default().fg(colors.accent).bg(colors.background));
+    let widget = if bordered {
+        widget.block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.border)),
+        )
+    } else {
+        widget
+    };
+    frame.render_widget(widget, area);
+    ui.click_targets.push((area, action));
+}
+
+fn render_context_menu(
+    frame: &mut ratatui::Frame,
+    ui: &mut Ui,
+    colors: Palette,
+    task_index: usize,
+    x: u16,
+    y: u16,
+) {
+    let bounds = frame.area();
+    let width = 24.min(bounds.width.saturating_sub(2));
+    let height = 6.min(bounds.height.saturating_sub(2));
+    let left = x
+        .min(bounds.right().saturating_sub(width + 1))
+        .max(bounds.x + 1);
+    let top = y
+        .min(bounds.bottom().saturating_sub(height + 1))
+        .max(bounds.y + 1);
+    let area = Rect::new(left, top, width, height);
+    frame.render_widget(Clear, area);
+    let task = &ui.data.tasks[task_index];
+    let archive_label = if task.archived {
+        "Restore task"
+    } else {
+        "Archive task"
+    };
+    let actions = [
+        ("Rename / modify", ClickAction::RenameTask(task_index)),
+        (archive_label, ClickAction::ToggleTaskArchive(task_index)),
+        ("Delete task…", ClickAction::DeleteTask(task_index)),
+        ("Dismiss", ClickAction::CloseContext),
+    ];
+    let rows: Vec<Line> = actions
+        .iter()
+        .map(|(label, _)| Line::from(format!("  {label}")))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .title(" TASK OPTIONS ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.accent))
+                .style(Style::default().bg(colors.background)),
+        ),
+        area,
+    );
+    for (index, (label, action)) in actions.into_iter().enumerate() {
+        let hit = Rect::new(
+            area.x + 1,
+            area.y + 1 + index as u16,
+            area.width.saturating_sub(2),
+            1,
+        );
+        ui.click_targets.push((hit, action));
+        let _ = label;
+    }
+}
+
+fn render_input(
+    frame: &mut ratatui::Frame,
+    ui: &mut Ui,
+    prompt: &str,
+    value: &str,
+    colors: Palette,
+) {
     let area = centered(frame.area(), 60, 20);
     frame.render_widget(Clear, area);
     let text = Paragraph::new(vec![
@@ -721,7 +1022,7 @@ fn render_input(frame: &mut ratatui::Frame, prompt: &str, value: &str, colors: P
         Line::from(format!("› {value}_")),
         Line::from(""),
         Line::from(Span::styled(
-            "Enter save · Esc cancel",
+            "Enter saves · Esc cancels",
             Style::default().fg(colors.muted),
         )),
     ])
@@ -734,9 +1035,89 @@ fn render_input(frame: &mut ratatui::Frame, prompt: &str, value: &str, colors: P
             .padding(ratatui::widgets::Padding::uniform(1)),
     );
     frame.render_widget(text, area);
+    let save = Rect::new(
+        area.x + 2,
+        area.bottom().saturating_sub(3),
+        18.min(area.width.saturating_sub(4)),
+        1,
+    );
+    let cancel = Rect::new(
+        area.right().saturating_sub(20),
+        area.bottom().saturating_sub(3),
+        18.min(area.width.saturating_sub(4)),
+        1,
+    );
+    draw_button(
+        frame,
+        ui,
+        save,
+        "Save",
+        colors,
+        ClickAction::SaveInput,
+        true,
+    );
+    draw_button(
+        frame,
+        ui,
+        cancel,
+        "Cancel",
+        colors,
+        ClickAction::CancelInput,
+        true,
+    );
 }
 
-fn render_help(frame: &mut ratatui::Frame, colors: Palette) {
+fn render_delete_confirmation(
+    frame: &mut ratatui::Frame,
+    ui: &mut Ui,
+    colors: Palette,
+    index: usize,
+) {
+    let area = centered(frame.area(), 58, 9);
+    frame.render_widget(Clear, area);
+    let message = format!(
+        "Delete {} and its recorded sessions?",
+        ui.data.tasks[index].name
+    );
+    frame.render_widget(
+        Paragraph::new(message).block(
+            Block::default()
+                .title("  CONFIRM DELETE  ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.accent))
+                .style(Style::default().bg(colors.background))
+                .padding(ratatui::widgets::Padding::uniform(1)),
+        ),
+        area,
+    );
+    let yes = Rect::new(area.x + 4, area.bottom().saturating_sub(3), 16, 1);
+    let no = Rect::new(
+        area.right().saturating_sub(20),
+        area.bottom().saturating_sub(3),
+        16,
+        1,
+    );
+    draw_button(
+        frame,
+        ui,
+        yes,
+        "Delete",
+        colors,
+        ClickAction::DeleteConfirm(index),
+        true,
+    );
+    draw_button(
+        frame,
+        ui,
+        no,
+        "Cancel",
+        colors,
+        ClickAction::DeleteCancel,
+        true,
+    );
+}
+
+fn render_help(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
     let area = centered(frame.area(), 72, 21);
     frame.render_widget(Clear, area);
     let help = vec![
@@ -791,6 +1172,7 @@ fn render_help(frame: &mut ratatui::Frame, colors: Palette) {
         ),
         area,
     );
+    ui.click_targets.push((area, ClickAction::CloseHelp));
 }
 
 fn render_compact(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
@@ -806,12 +1188,20 @@ fn render_compact(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
         ])
         .split(area);
     let title = Paragraph::new(Span::styled(
-        "◈ COMMITMENT ISSUES",
+        format!("‹ {} ›", ui.day.format("%a %b %-d")),
         Style::default()
             .fg(colors.accent)
             .add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(title, chunks[0]);
+    ui.click_targets.push((
+        Rect::new(chunks[0].x, chunks[0].y, 1, 1),
+        ClickAction::PreviousDay,
+    ));
+    ui.click_targets.push((
+        Rect::new(chunks[0].right().saturating_sub(1), chunks[0].y, 1, 1),
+        ClickAction::NextDay,
+    ));
     let task = ui.data.tasks.get(ui.selected).cloned();
     let running = ui
         .data
@@ -877,6 +1267,10 @@ fn render_compact(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
             ),
             ui.selected,
         )];
+        ui.click_targets
+            .push((ui.task_rows[0].0, ClickAction::SelectTask(ui.selected)));
+        ui.click_targets
+            .push((ui.button_areas[0].0, ClickAction::ActivateTask(ui.selected)));
         drop(task);
     } else {
         ui.button_areas.clear();
@@ -898,13 +1292,28 @@ fn render_compact(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
         Paragraph::new(running_line).style(Style::default().fg(colors.muted)),
         chunks[2],
     );
-    frame.render_widget(
-        Paragraph::new("↑↓ select · Enter start/stop · ? help · q quit")
-            .style(Style::default().fg(colors.accent)),
-        chunks[3],
-    );
+    let controls = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(20); 5])
+        .split(chunks[3]);
+    for (button, (label, action)) in controls.iter().copied().zip([
+        ("＋", ClickAction::NewTask),
+        ("◯", ClickAction::ToggleArchived),
+        ("◈", ClickAction::NextTheme),
+        ("?", ClickAction::Help),
+        ("×", ClickAction::Quit),
+    ]) {
+        draw_button(frame, ui, button, label, colors, action, false);
+    }
+    if let Some((task_index, x, y)) = ui.context_menu {
+        render_context_menu(frame, ui, colors, task_index, x, y);
+    }
     if ui.show_help {
-        render_help(frame, colors);
+        render_help(frame, ui, colors);
+    } else if let Some(index) = ui.delete_confirmation {
+        render_delete_confirmation(frame, ui, colors, index);
+    } else if let Some((prompt, value)) = ui.input.clone() {
+        render_input(frame, ui, &prompt, &value, colors);
     }
 }
 

@@ -564,10 +564,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
         ClickAction::PreviousDay,
         false,
     );
+    let selected_day_label = if ui.day == Local::now().date_naive() {
+        " TODAY "
+    } else {
+        " SELECTED "
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                " TODAY  ",
+                selected_day_label,
                 Style::default()
                     .bg(colors.accent)
                     .fg(colors.background)
@@ -575,7 +580,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
             ),
             Span::styled(
                 format!(" {} ", ui.day.format("%a, %b %-d, %Y")),
-                Style::default().fg(colors.text),
+                Style::default()
+                    .fg(colors.background)
+                    .bg(colors.accent)
+                    .add_modifier(Modifier::BOLD),
             ),
         ])),
         date_controls[1],
@@ -627,7 +635,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
         ("? Help", ClickAction::Help),
         ("× Quit", ClickAction::Quit),
     ]) {
-        draw_button(frame, ui, area, label, colors, action, true);
+        draw_button(frame, ui, area, label, colors, action, false);
     }
     if let Some((task_index, x, y)) = ui.context_menu {
         render_context_menu(frame, ui, colors, task_index, x, y);
@@ -1187,10 +1195,16 @@ fn render_compact(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
             Constraint::Length(1),
         ])
         .split(area);
+    let day_label = if ui.day == Local::now().date_naive() {
+        "TODAY"
+    } else {
+        "SELECTED"
+    };
     let title = Paragraph::new(Span::styled(
-        format!("‹ {} ›", ui.day.format("%a %b %-d")),
+        format!("‹ {day_label}: {} ›", ui.day.format("%a %b %-d")),
         Style::default()
-            .fg(colors.accent)
+            .fg(colors.background)
+            .bg(colors.accent)
             .add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(title, chunks[0]);

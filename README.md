@@ -10,7 +10,9 @@ cargo run --release
 cargo run -- --data-dir /path/to/data
 ```
 
-The app uses Ratatui, Crossterm, and Tokio. Click a task's **Start**, **Stop**, or **Switch** action, or use `↑`/`↓` and `Enter`. Press `n` to add a task, `r` to rename, `a` to archive or restore, `v` to show archived tasks, `[`/`]` to change the report day, and `q` to quit. `?` opens a help dialog. Press `t` to cycle through Midnight and Evergreen (dark), Arctic and Sandstone (light), and Default themes; `1`–`5` select a theme directly. The selected theme is stored in `theme.txt`.
+The app uses Ratatui, Crossterm, and Tokio. Click a task row to select it, double-click its name to rename it, or click its **Start**, **Stop**, or **Switch** action. Right-click a task for rename, archive/restore, and delete options; deletion asks for confirmation and refuses to remove a running task. Click the date arrows and footer buttons to navigate days, create tasks, show archived tasks, change themes, open help, or quit. The input and confirmation dialogs have clickable buttons too. Right-click support depends on the terminal sending right-button mouse events.
+
+Keyboard shortcuts remain available: `↑`/`↓` or `j`/`k` select a task, `Enter` starts or stops it, `n` creates a task, `r` renames, `a` archives or restores, `v` shows archived tasks, `[`/`]` changes the report day, and `q` quits. `?` opens a help dialog. Press `t` to cycle through Midnight and Evergreen (dark), Arctic and Sandstone (light), and Default themes; `1`–`5` select a theme directly. The selected theme is stored in `theme.txt`.
 
 The layout switches to stacked panels on narrower terminals and a compact view on short terminals. Task timers update every second. The Git panel shows commits for the selected local day and configured author, refreshing every 30 seconds. Git matches are day-and-author based and are not treated as task attribution.
 

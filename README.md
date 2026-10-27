@@ -25,11 +25,11 @@ export CLOCKIFY_API_KEY="your-clockify-api-key"
 cargo run --release
 ```
 
-The app discovers the API key's user and active workspace from Clockify. Starting a local task creates an active Clockify time entry with the task name as its description; stopping updates that entry's end time. No Clockify project is selected. The API key is read from the process environment and is never written to `settings.json`, `sessions.tsv`, or the app's sync-state file. If no key is set, the app remains a local-only tracker.
+The app discovers the API key's user and active workspace from Clockify. Press `g` to choose an existing Clockify project or create a new one. Press `m` on a local task to map it to an existing task in that project, clear its mapping, or create a matching Clockify task. Project and task IDs are saved in `settings.json` and `tasks.json`; the API key is never written to app data. Starting a local task creates a Clockify entry in the selected project and mapped task (when configured); stopping ends the running Clockify timer. Without an API key or selected project, local tracking remains available and any remote failure is shown for retry.
 
 Local records are saved before requests run, and network requests do not block the TUI. Clockify failures leave local time intact. Press `c` to retry the latest failed or local-only session. A failed start is retried as the complete local interval once it has been stopped. If a retry still fails, the status message tells you to add that session's full start-to-stop interval in Clockify manually. Pending sync state and Clockify entry IDs are stored in `clockify.json`; the session TSV columns are unchanged.
 
-Clockify's default global API endpoint is used. If the workspace is restricted to a regional endpoint, sync may fail and local tracking will continue; regional API base selection is not configurable yet.
+Clockify's default global API endpoint is used. If the workspace is restricted to a regional endpoint, sync may fail and local tracking will continue; regional API base selection is not configurable yet. Project/task choices cannot be changed while a local timer is running, preventing the active interval from silently changing its remote association.
 
 Data is stored in `tasks.json`, `settings.json`, and `sessions.tsv` in the selected data directory. The Rust version reads and writes the task and settings document shape and session TSV columns used by the Go version. Git commits are collected from the configured repository using the configured author or local `user.name`.
 

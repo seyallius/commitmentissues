@@ -87,6 +87,11 @@ async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
         delete_confirmation: None,
         clockify,
         clockify_sender,
+        clockify_projects: Vec::new(),
+        clockify_tasks: Vec::new(),
+        clockify_menu: false,
+        clockify_task_mode: false,
+        clockify_loading: false,
     };
     ui.refresh_git();
     ui.resume_clockify_sync();

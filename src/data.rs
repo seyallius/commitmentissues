@@ -17,6 +17,8 @@ pub(crate) struct Task {
     pub(crate) short_id: String,
     #[serde(default)]
     pub(crate) archived: bool,
+    #[serde(default)]
+    pub(crate) clockify_task_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +75,8 @@ pub(crate) struct Settings {
     pub(crate) repository_path: String,
     pub(crate) author_override: String,
     pub(crate) export_directory: String,
+    pub(crate) clockify_project_id: Option<String>,
+    pub(crate) clockify_project_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -111,6 +115,8 @@ impl AppData {
                     repository_path: d.repository_path,
                     author_override: d.author_override,
                     export_directory: d.export_directory,
+                    clockify_project_id: d.clockify_project_id,
+                    clockify_project_name: d.clockify_project_name,
                 })
                 .unwrap_or_default(),
         };
@@ -162,6 +168,8 @@ impl AppData {
                     repository_path: self.settings.repository_path.clone(),
                     author_override: self.settings.author_override.clone(),
                     export_directory: self.settings.export_directory.clone(),
+                    clockify_project_id: self.settings.clockify_project_id.clone(),
+                    clockify_project_name: self.settings.clockify_project_name.clone(),
                 },
             })?,
         )?;
@@ -247,6 +255,10 @@ struct SettingsDoc {
     author_override: String,
     #[serde(default)]
     export_directory: String,
+    #[serde(default)]
+    clockify_project_id: Option<String>,
+    #[serde(default)]
+    clockify_project_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -280,6 +292,7 @@ mod tests {
             name: "Write tests".into(),
             short_id: String::new(),
             archived: false,
+            clockify_task_id: Some("remote-task-1".into()),
         };
         let session = Session {
             id: "session-1".into(),
@@ -293,6 +306,11 @@ mod tests {
         let mut data = AppData {
             tasks: vec![task],
             sessions: vec![session],
+            settings: Settings {
+                clockify_project_id: Some("remote-project-1".into()),
+                clockify_project_name: Some("Project One".into()),
+                ..Settings::default()
+            },
             ..AppData::default()
         };
         data.clockify_sync.insert(
@@ -310,9 +328,31 @@ mod tests {
                 entry_id: "clockify-entry-1".into(),
             })
         );
+        assert_eq!(
+            loaded.settings.clockify_project_id.as_deref(),
+            Some("remote-project-1")
+        );
+        assert_eq!(
+            loaded.settings.clockify_project_name.as_deref(),
+            Some("Project One")
+        );
+        assert_eq!(
+            loaded.tasks[0].clockify_task_id.as_deref(),
+            Some("remote-task-1")
+        );
         let sessions_tsv = fs::read_to_string(root.join("sessions.tsv")).unwrap();
         assert_eq!(sessions_tsv.lines().next().unwrap().split('\t').count(), 9);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn settings_without_clockify_fields_remain_loadable() {
+        let legacy: Versioned<SettingsDoc> = serde_json::from_str(
+            r#"{"version":1,"repository_path":"repo","author_override":"","export_directory":""}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.data.clockify_project_id, None);
+        assert_eq!(legacy.data.clockify_project_name, None);
     }
 }
 

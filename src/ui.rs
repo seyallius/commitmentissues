@@ -1,5 +1,5 @@
 use crate::{
-    clockify::{ClockifyClient, SyncJob, SyncKind, SyncResult},
+    clockify::{ClockifyClient, ClockifyProject, ClockifyTask, SyncJob, SyncKind, SyncResult},
     data::{AppData, ClockifySync, Commit, Task},
     git::{collect_commits, new_session},
 };
@@ -41,6 +41,11 @@ pub(crate) struct Ui {
     pub(crate) delete_confirmation: Option<usize>,
     pub(crate) clockify: Option<ClockifyClient>,
     pub(crate) clockify_sender: UnboundedSender<SyncResult>,
+    pub(crate) clockify_projects: Vec<ClockifyProject>,
+    pub(crate) clockify_tasks: Vec<ClockifyTask>,
+    pub(crate) clockify_menu: bool,
+    pub(crate) clockify_task_mode: bool,
+    pub(crate) clockify_loading: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,6 +68,7 @@ pub(crate) enum ClickAction {
     CancelInput,
     CloseHelp,
     CloseContext,
+    ClockifyConfigure,
 }
 
 impl Ui {
@@ -180,6 +186,7 @@ impl Ui {
             }
             ClickAction::CloseHelp => self.show_help = false,
             ClickAction::CloseContext => self.context_menu = None,
+            ClickAction::ClockifyConfigure => self.open_clockify_config(),
         }
         false
     }
@@ -199,6 +206,7 @@ impl Ui {
                     name: value.trim().into(),
                     short_id: String::new(),
                     archived: false,
+                    clockify_task_id: None,
                 });
                 self.selected = self.data.tasks.len() - 1;
                 self.persist();
@@ -308,11 +316,13 @@ impl Ui {
             self.data
                 .clockify_sync
                 .insert(session.id.clone(), ClockifySync::PendingStart);
-            jobs.push(SyncJob::start(
+            let mut job = SyncJob::start(
                 session.id.clone(),
                 session.started_at,
                 self.data.tasks[task_index].name.clone(),
-            ));
+            );
+            self.configure_sync_job(&mut job, task_index);
+            jobs.push(job);
         }
         self.data.sessions.push(session);
     }
@@ -373,9 +383,13 @@ impl Ui {
                     },
                 );
                 if self.clockify.is_some() {
-                    jobs.push(SyncJob::stop(
-                        session_id, entry_id, started_at, now, task_name,
-                    ));
+                    let task_index = self.data.tasks.iter().position(|task| task.id == task_id);
+                    let job = SyncJob::stop(session_id, entry_id, started_at, now, task_name);
+                    if let Some(task_index) = task_index {
+                        jobs.push(self.job_for_task(job, task_index));
+                    } else {
+                        jobs.push(job);
+                    }
                 } else {
                     self.data.clockify_sync.insert(
                         session_id,
@@ -391,7 +405,9 @@ impl Ui {
                 self.data
                     .clockify_sync
                     .insert(session_id.clone(), ClockifySync::PendingComplete);
-                jobs.push(SyncJob::complete(session_id, started_at, now, task_name));
+                let task_index = self.data.tasks.iter().position(|task| task.id == task_id);
+                let job = SyncJob::complete(session_id, started_at, now, task_name);
+                jobs.push(task_index.map_or(job.clone(), |i| self.job_for_task(job, i)));
             }
             ClockifySync::LocalOnly => {}
             ClockifySync::FailedStart { error } => {
@@ -399,7 +415,9 @@ impl Ui {
                     self.data
                         .clockify_sync
                         .insert(session_id.clone(), ClockifySync::PendingComplete);
-                    jobs.push(SyncJob::complete(session_id, started_at, now, task_name));
+                    let task_index = self.data.tasks.iter().position(|task| task.id == task_id);
+                    let job = SyncJob::complete(session_id, started_at, now, task_name);
+                    jobs.push(task_index.map_or(job.clone(), |i| self.job_for_task(job, i)));
                     self.status = format!(
                         "Clockify start failed ({error}); retrying as a completed local interval…"
                     );
@@ -447,41 +465,186 @@ impl Ui {
         });
     }
 
+    fn job_for_task(&self, mut job: SyncJob, task_index: usize) -> SyncJob {
+        self.configure_sync_job(&mut job, task_index);
+        job
+    }
+
+    fn configure_sync_job(&self, job: &mut SyncJob, task_index: usize) {
+        job.project_id = self.data.settings.clockify_project_id.clone();
+        job.task_id = self
+            .data
+            .tasks
+            .get(task_index)
+            .and_then(|task| task.clockify_task_id.clone());
+    }
+
+    fn open_clockify_config(&mut self) {
+        if self.clockify.is_none() {
+            self.status =
+                "Set CLOCKIFY_API_KEY in your shell and restart to configure Clockify".into();
+            return;
+        }
+        self.clockify_menu = true;
+        self.clockify_task_mode = false;
+        self.clockify_loading = true;
+        self.clockify_projects.clear();
+        self.status = "Loading Clockify projects…".into();
+        let client = self.clockify.clone().unwrap();
+        let sender = self.clockify_sender.clone();
+        tokio::spawn(async move {
+            let _ = sender.send(ClockifyClient::project_list(client.list_projects().await));
+        });
+    }
+
+    fn open_clockify_task_picker(&mut self, task_index: usize) {
+        if task_index >= self.data.tasks.len() {
+            return;
+        }
+        if self.data.running().is_some_and(|running| {
+            self.data.sessions[running].task_id == self.data.tasks[task_index].id
+        }) {
+            self.status = "Stop the task before changing its Clockify task mapping".into();
+            return;
+        }
+        let Some(project_id) = self.data.settings.clockify_project_id.clone() else {
+            self.status = "Choose a Clockify project first with g".into();
+            return;
+        };
+        let Some(client) = self.clockify.clone() else {
+            self.status = "Set CLOCKIFY_API_KEY and restart before mapping tasks".into();
+            return;
+        };
+        self.selected = task_index;
+        self.clockify_menu = true;
+        self.clockify_task_mode = true;
+        self.clockify_loading = true;
+        let sender = self.clockify_sender.clone();
+        tokio::spawn(async move {
+            let _ = sender.send(ClockifyClient::task_list(
+                client.list_tasks(&project_id).await,
+            ));
+        });
+    }
+
+    fn choose_clockify_project(&mut self, index: usize) {
+        if self.data.running().is_some() {
+            self.status = "Stop the running timer before changing its Clockify project".into();
+            return;
+        }
+        let Some(project) = self.clockify_projects.get(index).cloned() else {
+            return;
+        };
+        self.data.settings.clockify_project_id = Some(project.id.clone());
+        self.data.settings.clockify_project_name = Some(project.name.clone());
+        for task in &mut self.data.tasks {
+            task.clockify_task_id = None;
+        }
+        self.clockify_menu = false;
+        if self.persist() {
+            self.status = format!("Clockify project set to {}", project.name);
+        }
+    }
+
+    fn choose_clockify_task(&mut self, index: usize) {
+        if index == self.clockify_tasks.len() {
+            if let Some(task) = self.data.tasks.get_mut(self.selected) {
+                task.clockify_task_id = None;
+            }
+            self.status = "Task mapping cleared".into();
+        } else if let (Some(task), Some(remote)) = (
+            self.data.tasks.get_mut(self.selected),
+            self.clockify_tasks.get(index),
+        ) {
+            task.clockify_task_id = Some(remote.id.clone());
+            self.status = format!("Mapped to {}", remote.name);
+        } else {
+            return;
+        }
+        self.clockify_menu = false;
+        self.persist();
+    }
+
+    fn create_clockify_project(&mut self, name: String) {
+        let Some(client) = self.clockify.clone() else {
+            return;
+        };
+        let sender = self.clockify_sender.clone();
+        self.clockify_loading = true;
+        tokio::spawn(async move {
+            let _ = sender.send(ClockifyClient::project_created(
+                client.create_project(&name).await,
+            ));
+        });
+    }
+
+    fn create_clockify_task(&mut self) {
+        let (Some(client), Some(project), Some(name)) = (
+            self.clockify.clone(),
+            self.data.settings.clockify_project_id.clone(),
+            self.data.tasks.get(self.selected).map(|t| t.name.clone()),
+        ) else {
+            return;
+        };
+        let sender = self.clockify_sender.clone();
+        let index = self.selected;
+        tokio::spawn(async move {
+            let _ = sender.send(ClockifyClient::task_created(
+                index,
+                client.create_task(&project, &name).await,
+            ));
+        });
+    }
+
     pub(crate) fn resume_clockify_sync(&mut self) {
         let mut jobs = Vec::new();
         for session in &self.data.sessions {
-            let Some(stopped_at) = session.stopped_at else {
-                if let Some(ClockifySync::PendingStart) = self.data.clockify_sync.get(&session.id) {
-                    jobs.push(SyncJob::start(
-                        session.id.clone(),
-                        session.started_at,
-                        self.data.task_name(&session.task_id).to_owned(),
-                    ));
-                }
-                continue;
-            };
-            let Some(sync) = self.data.clockify_sync.get(&session.id) else {
-                continue;
-            };
-            match sync {
-                ClockifySync::PendingStop {
-                    entry_id: Some(entry_id),
-                } => jobs.push(SyncJob::stop(
+            let sync = self
+                .data
+                .clockify_sync
+                .get(&session.id)
+                .cloned()
+                .unwrap_or_default();
+            let task_index = self.data.tasks.iter().position(|t| t.id == session.task_id);
+            let job = match sync {
+                ClockifySync::PendingStart if session.stopped_at.is_none() => Some(SyncJob::start(
                     session.id.clone(),
-                    entry_id.clone(),
                     session.started_at,
-                    stopped_at,
-                    self.data.task_name(&session.task_id).to_owned(),
+                    self.data.task_name(&session.task_id).into(),
                 )),
-                ClockifySync::PendingStop { entry_id: None } | ClockifySync::PendingComplete => {
-                    jobs.push(SyncJob::complete(
+                ClockifySync::PendingStart => session.stopped_at.map(|stopped_at| {
+                    SyncJob::complete(
                         session.id.clone(),
                         session.started_at,
                         stopped_at,
-                        self.data.task_name(&session.task_id).to_owned(),
-                    ))
+                        self.data.task_name(&session.task_id).into(),
+                    )
+                }),
+                ClockifySync::PendingStop {
+                    entry_id: Some(entry_id),
+                } => session.stopped_at.map(|stopped_at| {
+                    SyncJob::stop(
+                        session.id.clone(),
+                        entry_id,
+                        session.started_at,
+                        stopped_at,
+                        self.data.task_name(&session.task_id).into(),
+                    )
+                }),
+                ClockifySync::PendingStop { entry_id: None } | ClockifySync::PendingComplete => {
+                    session.stopped_at.map(|stopped_at| {
+                        SyncJob::complete(
+                            session.id.clone(),
+                            session.started_at,
+                            stopped_at,
+                            self.data.task_name(&session.task_id).into(),
+                        )
+                    })
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(job) = job {
+                jobs.push(task_index.map_or(job.clone(), |i| self.job_for_task(job, i)));
             }
         }
         for job in jobs {
@@ -490,6 +653,87 @@ impl Ui {
     }
 
     pub(crate) fn apply_clockify_result(&mut self, result: SyncResult) {
+        if let Some(config) = result.config {
+            self.clockify_loading = false;
+            match config {
+                crate::clockify::ClockifyConfigResult::Projects(Ok(projects)) => {
+                    self.clockify_projects = projects
+                        .into_iter()
+                        .filter(|p| !p.id.is_empty() && !p.name.is_empty())
+                        .collect();
+                    self.clockify_task_mode = false;
+                    self.clockify_menu = true;
+                    self.selected = 0;
+                    self.status = format!(
+                        "{} projects: choose one, n to create",
+                        self.clockify_projects.len()
+                    );
+                }
+                crate::clockify::ClockifyConfigResult::Projects(Err(error)) => {
+                    self.clockify_menu = false;
+                    self.status = format!("Could not load Clockify projects: {error}");
+                }
+                crate::clockify::ClockifyConfigResult::ProjectCreated(Ok(project)) => {
+                    if self.data.running().is_some() {
+                        self.clockify_menu = false;
+                        self.status = format!(
+                            "Created project {}; stop the running timer before selecting it",
+                            project.name
+                        );
+                        return;
+                    }
+                    self.data.settings.clockify_project_id = Some(project.id);
+                    self.data.settings.clockify_project_name = Some(project.name.clone());
+                    for task in &mut self.data.tasks {
+                        task.clockify_task_id = None;
+                    }
+                    self.clockify_menu = false;
+                    if self.persist() {
+                        self.status = format!("Created and selected project {}", project.name);
+                        self.open_clockify_task_picker(self.selected);
+                    }
+                }
+                crate::clockify::ClockifyConfigResult::ProjectCreated(Err(error)) => {
+                    self.clockify_menu = false;
+                    self.status = format!("Could not create Clockify project: {error}");
+                }
+                crate::clockify::ClockifyConfigResult::Tasks(Ok(tasks)) => {
+                    self.clockify_tasks = tasks
+                        .into_iter()
+                        .filter(|task| !task.id.is_empty() && !task.name.is_empty())
+                        .collect();
+                    self.clockify_task_mode = true;
+                    self.clockify_menu = true;
+                    self.selected = 0;
+                    self.status = format!(
+                        "{} tasks: select one, c to create matching task, u to clear",
+                        self.clockify_tasks.len()
+                    );
+                }
+                crate::clockify::ClockifyConfigResult::Tasks(Err(error)) => {
+                    self.clockify_menu = false;
+                    self.status = format!("Could not load Clockify tasks: {error}");
+                }
+                crate::clockify::ClockifyConfigResult::TaskCreated(index, Ok(task)) => {
+                    if let Some(local) = self.data.tasks.get_mut(index) {
+                        local.clockify_task_id = Some(task.id);
+                    }
+                    self.clockify_menu = false;
+                    if self.persist() {
+                        self.status = format!("Created and mapped Clockify task {}", task.name);
+                    }
+                }
+                crate::clockify::ClockifyConfigResult::TaskCreated(_, Err(error)) => {
+                    self.clockify_menu = false;
+                    self.status = format!("Could not create Clockify task: {error}");
+                }
+            }
+            return;
+        }
+        self.apply_sync_result(result);
+    }
+
+    pub(crate) fn apply_sync_result(&mut self, result: SyncResult) {
         let Some(session_index) = self
             .data
             .sessions
@@ -499,6 +743,8 @@ impl Ui {
             return;
         };
         let session = &self.data.sessions[session_index];
+        let task_id = session.task_id.clone();
+        let task_index = self.data.tasks.iter().position(|task| task.id == task_id);
         let task_name = self.data.task_name(&session.task_id).to_owned();
         let started_at = session.started_at;
         let stopped_at = session.stopped_at;
@@ -515,13 +761,15 @@ impl Ui {
                             entry_id: Some(entry_id.clone()),
                         },
                     );
-                    follow_up = Some(SyncJob::stop(
+                    let job = SyncJob::stop(
                         result.session_id,
                         entry_id,
                         started_at,
                         stopped_at,
                         task_name,
-                    ));
+                    );
+                    follow_up =
+                        Some(task_index.map_or(job.clone(), |index| self.job_for_task(job, index)));
                     self.status = "Clockify timer started and stopped; saving its end time…".into();
                 } else {
                     self.data
@@ -532,12 +780,14 @@ impl Ui {
             }
             (SyncKind::Start, Some(error)) => {
                 let state = if stopped_at.is_some() {
-                    follow_up = Some(SyncJob::complete(
+                    let job = SyncJob::complete(
                         result.session_id.clone(),
                         started_at,
                         stopped_at.unwrap_or_else(Local::now),
                         task_name,
-                    ));
+                    );
+                    follow_up =
+                        Some(task_index.map_or(job.clone(), |index| self.job_for_task(job, index)));
                     ClockifySync::PendingComplete
                 } else {
                     ClockifySync::FailedStart {
@@ -551,7 +801,7 @@ impl Ui {
                     )
                 } else {
                     format!(
-                        "Clockify start failed: {error}. Local timer is running; stopping will retry the complete interval. If that fails, enter the interval manually in Clockify."
+                        "Clockify start failed: {error}. Local timer is running; stopping will retry the full interval. If retry fails, enter it manually in Clockify."
                     )
                 };
             }
@@ -625,6 +875,11 @@ impl Ui {
             return;
         };
         let session = &self.data.sessions[index];
+        let task_index = self
+            .data
+            .tasks
+            .iter()
+            .position(|task| task.id == session.task_id);
         let session_id = session.id.clone();
         let started_at = session.started_at;
         let stopped_at = session.stopped_at;
@@ -660,6 +915,7 @@ impl Ui {
                 SyncJob::start(session_id, started_at, task_name)
             }
         };
+        let job = task_index.map_or(job.clone(), |task_index| self.job_for_task(job, task_index));
         if self.persist() {
             self.status = "Retrying Clockify sync…".into();
             self.dispatch_sync(job);
@@ -678,7 +934,7 @@ impl Ui {
 
 fn clockify_failure_prompt(operation: &str, detail: &str) -> String {
     format!(
-        "Clockify {operation} failed ({detail}). Local time is saved. Enter the full start-to-stop interval manually in Clockify; press c to retry sync if you prefer."
+        "Clockify {operation} failed ({detail}). Local time is saved. Enter the full interval manually in Clockify; press c to retry."
     )
 }
 
@@ -690,12 +946,16 @@ pub(crate) fn handle_key(ui: &mut Ui, key: KeyCode) -> bool {
         }
         if key == KeyCode::Enter {
             match prompt.as_str() {
+                "Clockify project name" if !value.trim().is_empty() => {
+                    ui.create_clockify_project(value.trim().to_owned());
+                }
                 "New task" if !value.trim().is_empty() => {
                     ui.data.tasks.push(Task {
                         id: Uuid::new_v4().simple().to_string(),
                         name: value.trim().into(),
                         short_id: String::new(),
                         archived: false,
+                        clockify_task_id: None,
                     });
                     ui.selected = ui.data.tasks.len() - 1;
                     ui.persist();
@@ -727,6 +987,42 @@ pub(crate) fn handle_key(ui: &mut Ui, key: KeyCode) -> bool {
         }
         return false;
     }
+    if ui.clockify_menu {
+        match key {
+            KeyCode::Esc | KeyCode::Char('g') => {
+                ui.clockify_menu = false;
+                ui.status = "Clockify configuration closed".into();
+            }
+            KeyCode::Down | KeyCode::Char('j') => ui.step_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => ui.step_selection(-1),
+            KeyCode::Enter | KeyCode::Char(' ') if !ui.clockify_loading => {
+                if ui.clockify_task_mode {
+                    ui.choose_clockify_task(ui.selected);
+                } else {
+                    ui.choose_clockify_project(ui.selected);
+                }
+            }
+            KeyCode::Char(ch @ '0'..='9') if !ui.clockify_loading => {
+                let index = (ch as usize) - ('0' as usize);
+                if ui.clockify_task_mode {
+                    ui.choose_clockify_task(index);
+                } else {
+                    ui.choose_clockify_project(index);
+                }
+            }
+            KeyCode::Char('n') if !ui.clockify_task_mode && !ui.clockify_loading => {
+                ui.input = Some(("Clockify project name".into(), String::new()))
+            }
+            KeyCode::Char('c') if ui.clockify_task_mode && !ui.clockify_loading => {
+                ui.create_clockify_task()
+            }
+            KeyCode::Char('u') if ui.clockify_task_mode && !ui.clockify_loading => {
+                ui.choose_clockify_task(ui.clockify_tasks.len())
+            }
+            _ => {}
+        }
+        return false;
+    }
     match key {
         KeyCode::Char('q') => return true,
         KeyCode::Down | KeyCode::Char('j') => ui.step_selection(1),
@@ -734,6 +1030,10 @@ pub(crate) fn handle_key(ui: &mut Ui, key: KeyCode) -> bool {
         KeyCode::Enter | KeyCode::Char(' ') => ui.activate(ui.selected),
         KeyCode::Char('n') => ui.input = Some(("New task".into(), String::new())),
         KeyCode::Char('c') => ui.retry_clockify(),
+        KeyCode::Char('g') => ui.open_clockify_config(),
+        KeyCode::Char('m') if ui.selected < ui.data.tasks.len() => {
+            ui.open_clockify_task_picker(ui.selected)
+        }
         KeyCode::Char('r') if ui.selected < ui.data.tasks.len() => {
             ui.input = Some((
                 "Rename task".into(),
@@ -977,7 +1277,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
     render_report(frame, ui, split[1], colors);
     let footer_buttons = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(20); 5])
+        .constraints([Constraint::Percentage(16); 6])
         .split(layout[3]);
     for (area, (label, action)) in footer_buttons.iter().copied().zip([
         ("＋ New task", ClickAction::NewTask),
@@ -990,6 +1290,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
             ClickAction::ToggleArchived,
         ),
         ("◈ Theme", ClickAction::NextTheme),
+        ("g Clockify", ClickAction::ClockifyConfigure),
         ("? Help", ClickAction::Help),
         ("× Quit", ClickAction::Quit),
     ]) {
@@ -998,6 +1299,9 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
     if let Some((task_index, x, y)) = ui.context_menu {
         render_context_menu(frame, ui, colors, task_index, x, y);
     }
+    if ui.clockify_menu {
+        render_clockify_menu(frame, ui, colors);
+    }
     if let Some((prompt, value)) = ui.input.clone() {
         render_input(frame, ui, &prompt, &value, colors);
     } else if let Some(index) = ui.delete_confirmation {
@@ -1005,6 +1309,82 @@ pub(crate) fn render(frame: &mut ratatui::Frame, ui: &mut Ui) {
     } else if ui.show_help {
         render_help(frame, ui, colors);
     }
+}
+
+fn render_clockify_menu(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
+    let area = centered(frame.area(), 76, 20);
+    frame.render_widget(Clear, area);
+    let title = if ui.clockify_task_mode {
+        "Map local task to Clockify task"
+    } else {
+        "Choose a Clockify project"
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(colors.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if ui.clockify_loading {
+        lines.push(Line::from("Loading…"));
+    } else if ui.clockify_task_mode {
+        for (index, task) in ui.clockify_tasks.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{}  {}",
+                    if index == ui.selected { "›" } else { " " },
+                    task.name
+                ),
+                if index == ui.selected {
+                    Style::default()
+                        .fg(colors.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(colors.text)
+                },
+            )));
+        }
+        lines.push(Line::from("u  Clear task mapping"));
+        lines.push(Line::from("c  Create matching task in selected project"));
+    } else {
+        for (index, project) in ui.clockify_projects.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{}  {}{}",
+                    if index == ui.selected { "›" } else { " " },
+                    project.name,
+                    if ui.data.settings.clockify_project_id.as_deref() == Some(project.id.as_str())
+                    {
+                        " (selected)"
+                    } else {
+                        ""
+                    }
+                ),
+                if index == ui.selected {
+                    Style::default()
+                        .fg(colors.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(colors.text)
+                },
+            )));
+        }
+        lines.push(Line::from("n  Create a new project"));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" CLOCKIFY ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors.accent))
+                .style(Style::default().bg(colors.background))
+                .padding(ratatui::widgets::Padding::uniform(1)),
+        ),
+        area,
+    );
 }
 
 fn render_tasks(frame: &mut ratatui::Frame, ui: &mut Ui, area: Rect, colors: Palette) {
@@ -1523,6 +1903,10 @@ fn render_help(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
             Span::raw("             Retry the latest local or failed Clockify session"),
         ]),
         Line::from(vec![
+            Span::styled("g / m", Style::default().fg(colors.accent)),
+            Span::raw("         Choose project / map selected task"),
+        ]),
+        Line::from(vec![
             Span::styled("? / F1 / Esc", Style::default().fg(colors.accent)),
             Span::raw("  Close this help"),
         ]),
@@ -1734,6 +2118,7 @@ mod tests {
             name: "Write tests".into(),
             short_id: String::new(),
             archived: false,
+            clockify_task_id: None,
         };
         let session = Session {
             id: "session-1".into(),
@@ -1776,6 +2161,11 @@ mod tests {
             delete_confirmation: None,
             clockify: None,
             clockify_sender,
+            clockify_projects: Vec::new(),
+            clockify_tasks: Vec::new(),
+            clockify_menu: false,
+            clockify_task_mode: false,
+            clockify_loading: false,
         };
 
         ui.apply_clockify_result(SyncResult {
@@ -1783,6 +2173,7 @@ mod tests {
             kind: SyncKind::Start,
             entry_id: None,
             error: Some("Clockify returned HTTP 401".into()),
+            config: None,
         });
         assert!(ui.data.running().is_some());
         assert!(ui.status.contains("timer is running"));

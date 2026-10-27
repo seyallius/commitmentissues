@@ -28,7 +28,7 @@ struct Identity {
     user_id: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SyncJob {
     pub(crate) session_id: String,
     pub(crate) kind: SyncKind,
@@ -36,6 +36,20 @@ pub(crate) struct SyncJob {
     pub(crate) started_at: DateTime<Local>,
     pub(crate) stopped_at: Option<DateTime<Local>>,
     pub(crate) description: String,
+    pub(crate) project_id: Option<String>,
+    pub(crate) task_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ClockifyProject {
+    pub(crate) id: String,
+    pub(crate) name: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct ClockifyTask {
+    pub(crate) id: String,
+    pub(crate) name: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +65,15 @@ pub(crate) struct SyncResult {
     pub(crate) kind: SyncKind,
     pub(crate) entry_id: Option<String>,
     pub(crate) error: Option<String>,
+    pub(crate) config: Option<ClockifyConfigResult>,
+}
+
+#[derive(Debug)]
+pub(crate) enum ClockifyConfigResult {
+    Projects(Result<Vec<ClockifyProject>, String>),
+    ProjectCreated(Result<ClockifyProject, String>),
+    Tasks(Result<Vec<ClockifyTask>, String>),
+    TaskCreated(usize, Result<ClockifyTask, String>),
 }
 
 #[derive(Deserialize)]
@@ -68,6 +91,10 @@ struct TimeEntryRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     end: Option<String>,
     description: &'a str,
+    #[serde(rename = "projectId", skip_serializing_if = "Option::is_none")]
+    project_id: Option<&'a str>,
+    #[serde(rename = "taskId", skip_serializing_if = "Option::is_none")]
+    task_id: Option<&'a str>,
     #[serde(rename = "type")]
     entry_type: &'static str,
 }
@@ -105,6 +132,84 @@ impl ClockifyClient {
             http: Client::new(),
             identity: Arc::new(OnceCell::new()),
         }
+    }
+
+    pub(crate) async fn list_projects(&self) -> Result<Vec<ClockifyProject>> {
+        let identity = self.identity().await?;
+        let response = self
+            .http
+            .get(format!(
+                "{}/workspaces/{}/projects?archived=false",
+                self.api_base, identity.workspace_id
+            ))
+            .header("X-Api-Key", self.api_key.as_ref())
+            .send()
+            .await
+            .context("list Clockify projects")?;
+        check_status(response, "list projects")
+            .await?
+            .json()
+            .await
+            .context("read Clockify projects")
+    }
+
+    pub(crate) async fn create_project(&self, name: &str) -> Result<ClockifyProject> {
+        let identity = self.identity().await?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/workspaces/{}/projects",
+                self.api_base, identity.workspace_id
+            ))
+            .header("X-Api-Key", self.api_key.as_ref())
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .context("create Clockify project")?;
+        check_status(response, "create project")
+            .await?
+            .json()
+            .await
+            .context("read created Clockify project")
+    }
+
+    pub(crate) async fn list_tasks(&self, project_id: &str) -> Result<Vec<ClockifyTask>> {
+        let identity = self.identity().await?;
+        let response = self
+            .http
+            .get(format!(
+                "{}/workspaces/{}/projects/{}/tasks?is-active=true",
+                self.api_base, identity.workspace_id, project_id
+            ))
+            .header("X-Api-Key", self.api_key.as_ref())
+            .send()
+            .await
+            .context("list Clockify project tasks")?;
+        check_status(response, "list project tasks")
+            .await?
+            .json()
+            .await
+            .context("read Clockify tasks")
+    }
+
+    pub(crate) async fn create_task(&self, project_id: &str, name: &str) -> Result<ClockifyTask> {
+        let identity = self.identity().await?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/workspaces/{}/projects/{}/tasks",
+                self.api_base, identity.workspace_id, project_id
+            ))
+            .header("X-Api-Key", self.api_key.as_ref())
+            .json(&serde_json::json!({ "name": name, "status": "ACTIVE" }))
+            .send()
+            .await
+            .context("create Clockify project task")?;
+        check_status(response, "create project task")
+            .await?
+            .json()
+            .await
+            .context("read created Clockify task")
     }
 
     async fn identity(&self) -> Result<&Identity> {
@@ -158,13 +263,50 @@ impl ClockifyClient {
                 kind,
                 entry_id: entry_id.or(existing_entry_id),
                 error: None,
+                config: None,
             },
             Err(error) => SyncResult {
                 session_id,
                 kind,
                 entry_id: existing_entry_id,
                 error: Some(format!("{error:#}")),
+                config: None,
             },
+        }
+    }
+
+    pub(crate) fn project_list(result: Result<Vec<ClockifyProject>>) -> SyncResult {
+        Self::config_result(ClockifyConfigResult::Projects(
+            result.map_err(|e| format!("{e:#}")),
+        ))
+    }
+
+    pub(crate) fn project_created(result: Result<ClockifyProject>) -> SyncResult {
+        Self::config_result(ClockifyConfigResult::ProjectCreated(
+            result.map_err(|e| format!("{e:#}")),
+        ))
+    }
+
+    pub(crate) fn task_list(result: Result<Vec<ClockifyTask>>) -> SyncResult {
+        Self::config_result(ClockifyConfigResult::Tasks(
+            result.map_err(|e| format!("{e:#}")),
+        ))
+    }
+
+    pub(crate) fn task_created(index: usize, result: Result<ClockifyTask>) -> SyncResult {
+        Self::config_result(ClockifyConfigResult::TaskCreated(
+            index,
+            result.map_err(|e| format!("{e:#}")),
+        ))
+    }
+
+    fn config_result(config: ClockifyConfigResult) -> SyncResult {
+        SyncResult {
+            session_id: String::new(),
+            kind: SyncKind::Start,
+            entry_id: None,
+            error: None,
+            config: Some(config),
         }
     }
 
@@ -185,6 +327,8 @@ impl ClockifyClient {
             start: job.started_at.to_rfc3339(),
             end: end.map(|value| value.to_rfc3339()),
             description: &job.description,
+            project_id: job.project_id.as_deref(),
+            task_id: job.task_id.as_deref(),
             entry_type: "REGULAR",
         };
         let response = self
@@ -213,26 +357,20 @@ impl ClockifyClient {
         let end = job
             .stopped_at
             .context("cannot stop a Clockify entry without a local stop time")?;
-        let entry_id = job
+        let _entry_id = job
             .entry_id
             .as_deref()
             .filter(|id| !id.is_empty())
             .context("Clockify stop job has no time-entry ID")?;
         let identity = self.identity().await?;
-        let payload = TimeEntryRequest {
-            start: job.started_at.to_rfc3339(),
-            end: Some(end.to_rfc3339()),
-            description: &job.description,
-            entry_type: "REGULAR",
-        };
         let response = self
             .http
-            .put(format!(
-                "{}/workspaces/{}/time-entries/{}",
-                self.api_base, identity.workspace_id, entry_id
+            .patch(format!(
+                "{}/workspaces/{}/user/{}/time-entries",
+                self.api_base, identity.workspace_id, identity.user_id
             ))
             .header("X-Api-Key", self.api_key.as_ref())
-            .json(&payload)
+            .json(&serde_json::json!({ "end": end.to_rfc3339() }))
             .send()
             .await
             .context("stop the Clockify time entry")?;
@@ -262,6 +400,8 @@ impl SyncJob {
             started_at,
             stopped_at: None,
             description,
+            project_id: None,
+            task_id: None,
         }
     }
 
@@ -278,6 +418,8 @@ impl SyncJob {
             started_at,
             stopped_at: Some(stopped_at),
             description,
+            project_id: None,
+            task_id: None,
         }
     }
 
@@ -295,6 +437,8 @@ impl SyncJob {
             started_at,
             stopped_at: Some(stopped_at),
             description,
+            project_id: None,
+            task_id: None,
         }
     }
 }
@@ -339,13 +483,10 @@ mod tests {
         let client = ClockifyClient::for_test("test-secret", format!("http://{address}/api/v1"));
         let start = Local.with_ymd_and_hms(2026, 10, 27, 9, 30, 0).unwrap();
         let stop = Local.with_ymd_and_hms(2026, 10, 27, 10, 0, 0).unwrap();
-        let started = client
-            .execute(SyncJob::start(
-                "session-1".into(),
-                start,
-                "Implement feature".into(),
-            ))
-            .await;
+        let mut start_job = SyncJob::start("session-1".into(), start, "Implement feature".into());
+        start_job.project_id = Some("project-1".into());
+        start_job.task_id = Some("task-1".into());
+        let started = client.execute(start_job).await;
         assert_eq!(started.error, None);
         assert_eq!(started.entry_id.as_deref(), Some("entry-1"));
         let stopped = client
@@ -358,14 +499,11 @@ mod tests {
             ))
             .await;
         assert_eq!(stopped.error, None);
-        let retried = client
-            .execute(SyncJob::complete(
-                "session-2".into(),
-                start,
-                stop,
-                "Review feature".into(),
-            ))
-            .await;
+        let mut retry_job =
+            SyncJob::complete("session-2".into(), start, stop, "Review feature".into());
+        retry_job.project_id = Some("project-1".into());
+        retry_job.task_id = Some("task-2".into());
+        let retried = client.execute(retry_job).await;
         assert_eq!(retried.error, None);
         assert_eq!(retried.entry_id.as_deref(), Some("entry-2"));
 
@@ -377,9 +515,9 @@ mod tests {
             )
         );
         assert!(
-            requests[2]
-                .head
-                .starts_with("PUT /api/v1/workspaces/workspace-1/time-entries/entry-1 HTTP/1.1")
+            requests[2].head.starts_with(
+                "PATCH /api/v1/workspaces/workspace-1/user/user-1/time-entries HTTP/1.1"
+            )
         );
         assert!(
             requests[3].head.starts_with(
@@ -396,16 +534,18 @@ mod tests {
         }
         let start_body: Value = serde_json::from_str(&requests[1].body).unwrap();
         assert_eq!(start_body["description"], "Implement feature");
+        assert_eq!(start_body["projectId"], "project-1");
+        assert_eq!(start_body["taskId"], "task-1");
         assert!(start_body.get("end").is_none());
         assert_eq!(start_body["type"], "REGULAR");
         let stop_body: Value = serde_json::from_str(&requests[2].body).unwrap();
-        assert_eq!(stop_body["end"], stop.to_rfc3339());
-        assert_eq!(stop_body["start"], start.to_rfc3339());
-        assert_eq!(stop_body["description"], "Implement feature");
+        assert_eq!(stop_body, serde_json::json!({ "end": stop.to_rfc3339() }));
         let retry_body: Value = serde_json::from_str(&requests[3].body).unwrap();
         assert_eq!(retry_body["start"], start.to_rfc3339());
         assert_eq!(retry_body["end"], stop.to_rfc3339());
         assert_eq!(retry_body["description"], "Review feature");
+        assert_eq!(retry_body["projectId"], "project-1");
+        assert_eq!(retry_body["taskId"], "task-2");
     }
 
     #[tokio::test]
@@ -431,6 +571,79 @@ mod tests {
         assert!(error.contains("HTTP 401"));
         assert!(!error.contains("test-secret"));
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_and_task_configuration_uses_workspace_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in [
+                (
+                    "200 OK",
+                    r#"{"id":"user-1","activeWorkspace":"workspace-1"}"#,
+                ),
+                ("200 OK", r#"[{"id":"project-1","name":"Existing"}]"#),
+                ("201 Created", r#"{"id":"project-2","name":"New Project"}"#),
+                ("200 OK", r#"[{"id":"task-1","name":"Existing Task"}]"#),
+                ("201 Created", r#"{"id":"task-2","name":"New Task"}"#),
+            ] {
+                let (stream, _) = listener.accept().unwrap();
+                let (request, mut stream) = read_request(stream);
+                requests.push(request);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        let client = ClockifyClient::for_test("test-secret", format!("http://{address}/api/v1"));
+        assert_eq!(client.list_projects().await.unwrap()[0].name, "Existing");
+        assert_eq!(
+            client.create_project("New Project").await.unwrap().id,
+            "project-2"
+        );
+        assert_eq!(
+            client.list_tasks("project-1").await.unwrap()[0].name,
+            "Existing Task"
+        );
+        assert_eq!(
+            client
+                .create_task("project-1", "New Task")
+                .await
+                .unwrap()
+                .id,
+            "task-2"
+        );
+        let requests = server.join().unwrap();
+        assert!(
+            requests[1]
+                .head
+                .starts_with("GET /api/v1/workspaces/workspace-1/projects?archived=false HTTP/1.1")
+        );
+        assert!(
+            requests[2]
+                .head
+                .starts_with("POST /api/v1/workspaces/workspace-1/projects HTTP/1.1")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&requests[2].body).unwrap()["name"],
+            "New Project"
+        );
+        assert!(requests[3].head.starts_with(
+            "GET /api/v1/workspaces/workspace-1/projects/project-1/tasks?is-active=true HTTP/1.1"
+        ));
+        assert!(
+            requests[4].head.starts_with(
+                "POST /api/v1/workspaces/workspace-1/projects/project-1/tasks HTTP/1.1"
+            )
+        );
+        let task_body: Value = serde_json::from_str(&requests[4].body).unwrap();
+        assert_eq!(task_body["name"], "New Task");
+        assert_eq!(task_body["status"], "ACTIVE");
     }
 
     struct CapturedRequest {

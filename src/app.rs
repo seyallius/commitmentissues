@@ -3,7 +3,7 @@ use crate::{
     data::AppData,
     ui::{Ui, handle_key, render},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::Local;
 use crossterm::{
     event::{Event, EventStream, KeyEventKind, MouseEventKind},
@@ -16,7 +16,11 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Position, Rect},
 };
-use std::{io, path::PathBuf, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval, interval_at};
 
@@ -37,19 +41,93 @@ fn parse_data_dir() -> Result<PathBuf> {
             .map(PathBuf::from)
             .context("--data-dir requires a path");
     }
-    Ok(PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join("commitmentissues"))
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .context("HOME or USERPROFILE is not set")?;
+    default_data_dir(&home)
+}
+
+fn default_data_dir(home: &Path) -> Result<PathBuf> {
+    let current = home.join(".commitmentissues");
+    let legacy = home.join("commitmentissues");
+    match (current.exists(), legacy.exists()) {
+        (false, true) => fs::rename(&legacy, &current).with_context(|| {
+            format!(
+                "move existing data directory {} to {}",
+                legacy.display(),
+                current.display()
+            )
+        })?,
+        (true, true) => bail!(
+            "both {} and {} exist; choose a data directory explicitly with --data-dir",
+            current.display(),
+            legacy.display()
+        ),
+        _ => {}
+    }
+    Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_data_dir;
+    use std::{fs, path::PathBuf};
+    use uuid::Uuid;
+
+    fn temp_home() -> PathBuf {
+        std::env::temp_dir().join(format!("commitmentissues-home-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn migrates_legacy_directory_when_hidden_directory_is_absent() {
+        let home = temp_home();
+        let legacy = home.join("commitmentissues");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("tasks.json"), "[]").unwrap();
+
+        let result = default_data_dir(&home).unwrap();
+
+        assert_eq!(result, home.join(".commitmentissues"));
+        assert!(!legacy.exists());
+        assert_eq!(fs::read_to_string(result.join("tasks.json")).unwrap(), "[]");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_choose_between_existing_directories() {
+        let home = temp_home();
+        let current = home.join(".commitmentissues");
+        let legacy = home.join("commitmentissues");
+        fs::create_dir_all(&current).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(current.join("tasks.json"), "current").unwrap();
+        fs::write(legacy.join("tasks.json"), "legacy").unwrap();
+
+        assert!(default_data_dir(&home).is_err());
+        assert_eq!(
+            fs::read_to_string(current.join("tasks.json")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            fs::read_to_string(legacy.join("tasks.json")).unwrap(),
+            "legacy"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
 }
 
 async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
     let theme = Ui::load_theme(&root);
-    let (clockify, clockify_status) = match ClockifyClient::from_env() {
+    let (clockify, clockify_status) = match ClockifyClient::from_config(&root.join("config.toml")) {
         Ok(Some(client)) => (
             Some(client),
             "Ready · Clockify configured; local records remain authoritative".to_owned(),
         ),
         Ok(None) => (
             None,
-            "Ready · local tracking; set CLOCKIFY_API_KEY to enable Clockify".to_owned(),
+            "Ready · local tracking; add [clockify].api_key to config.toml to enable Clockify"
+                .to_owned(),
         ),
         Err(error) => (
             None,

@@ -6,7 +6,7 @@ A local terminal time tracker with daily task totals and Git commit context.
 
 ```sh
 cargo run --release
-# Optional data directory (defaults to ~/commitmentissues)
+# Optional data directory (defaults to ~/.commitmentissues)
 cargo run -- --data-dir /path/to/data
 ```
 
@@ -18,20 +18,20 @@ The layout switches to stacked panels on narrower terminals and a compact view o
 
 ## Optional Clockify sync
 
-Clockify sync is optional. In the WSL shell, set `CLOCKIFY_API_KEY` before starting the app:
+Clockify sync is optional. Store the API key in `~/.commitmentissues/config.toml`:
 
-```sh
-export CLOCKIFY_API_KEY="your-clockify-api-key"
-cargo run --release
+```toml
+[clockify]
+api_key = "your-clockify-api-key"
 ```
 
-The app discovers the API key's user and active workspace from Clockify. Press `g` to choose an existing Clockify project or create a new one. Press `m` on a local task to map it to an existing task in that project, clear its mapping, or create a matching Clockify task. Project and task IDs are saved in `settings.json` and `tasks.json`; the API key is never written to app data. Starting a local task creates a Clockify entry in the selected project and mapped task (when configured); stopping ends the running Clockify timer. Without an API key or selected project, local tracking remains available and any remote failure is shown for retry.
+On Unix, restrict the file to your user (`chmod 600 ~/.commitmentissues/config.toml`). Windows uses the file's inherited access controls. The key is read from this file and is never included in error messages. Restart the app after changing it. The app discovers the API key's user and active workspace from Clockify. Press `g` to choose an existing Clockify project or create a new one. Press `m` on a local task to map it to an existing task in that project, clear its mapping, or create a matching Clockify task. Project and task IDs are saved in `settings.json` and `tasks.json`. Starting a local task creates a Clockify entry in the selected project and mapped task (when configured); stopping ends the running Clockify timer. Without an API key or selected project, local tracking remains available and any remote failure is shown for retry.
 
 Local records are saved before requests run, and network requests do not block the TUI. Clockify failures leave local time intact. Press `c` to retry the latest failed or local-only session. A failed start is retried as the complete local interval once it has been stopped. If a retry still fails, the status message tells you to add that session's full start-to-stop interval in Clockify manually. Pending sync state and Clockify entry IDs are stored in `clockify.json`; the session TSV columns are unchanged.
 
 Clockify's default global API endpoint is used. If the workspace is restricted to a regional endpoint, sync may fail and local tracking will continue; regional API base selection is not configurable yet. Project/task choices cannot be changed while a local timer is running, preventing the active interval from silently changing its remote association.
 
-Data is stored in `tasks.json`, `settings.json`, and `sessions.tsv` in the selected data directory. The Rust version reads and writes the task and settings document shape and session TSV columns used by the Go version. Git commits are collected from the configured repository using the configured author or local `user.name`.
+Data is stored in `tasks.json`, `settings.json`, `sessions.tsv`, and `config.toml` in the selected data directory. The default directory is `~/.commitmentissues`; on first launch after upgrading, the previous `~/commitmentissues` directory is moved there if the new directory does not exist. If both directories exist, choose one with `--data-dir` before continuing. The Rust version reads and writes the task and settings document shape and session TSV columns used by the Go version. Git commits are collected from the configured repository using the configured author or local `user.name`.
 
 ## Code layout
 

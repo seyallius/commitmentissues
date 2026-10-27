@@ -1,14 +1,14 @@
 //! Clockify API operations used by the local-first timer.
 //!
-//! Credentials come only from `CLOCKIFY_API_KEY`; this module never writes them
-//! to application data. Network errors are returned to the UI so local tracking
-//! can continue and the user can retry later.
+//! Credentials are read from the user's TOML config and never emitted in errors.
+//! Network errors are returned to the UI so local tracking can continue and the
+//! user can retry later.
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
-use std::{sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::OnceCell;
 
 const DEFAULT_API_BASE: &str = "https://api.clockify.me/api/v1";
@@ -104,20 +104,50 @@ struct TimeEntryResponse {
     id: String,
 }
 
+#[derive(Deserialize, Default)]
+struct AppConfig {
+    #[serde(default)]
+    clockify: ClockifyCredentials,
+}
+
+#[derive(Deserialize, Default)]
+struct ClockifyCredentials {
+    #[serde(default)]
+    api_key: String,
+}
+
 impl ClockifyClient {
-    /// Builds a client when `CLOCKIFY_API_KEY` is set and non-empty.
-    pub(crate) fn from_env() -> Result<Option<Self>> {
-        let api_key = match std::env::var("CLOCKIFY_API_KEY") {
-            Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
-            Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
-            Err(_) => bail!("CLOCKIFY_API_KEY is not valid Unicode"),
+    /// Builds a client when the TOML config contains a non-empty API key.
+    pub(crate) fn from_config(path: &Path) -> Result<Option<Self>> {
+        let source = match std::fs::read_to_string(path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                bail!(
+                    "{} has permissions that expose the API key; run chmod 600 {}",
+                    path.display(),
+                    path.display()
+                );
+            }
+        }
+        let config: AppConfig = toml::from_str(&source)
+            .with_context(|| format!("parse Clockify settings in {}", path.display()))?;
+        let api_key = config.clockify.api_key.trim();
+        if api_key.is_empty() {
+            return Ok(None);
+        }
         let http = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("create Clockify HTTP client")?;
         Ok(Some(Self {
-            api_key: Arc::from(api_key),
+            api_key: Arc::from(api_key.to_owned()),
             api_base: Arc::from(DEFAULT_API_BASE),
             http,
             identity: Arc::new(OnceCell::new()),
@@ -376,6 +406,66 @@ impl ClockifyClient {
             .context("stop the Clockify time entry")?;
         check_status(response, "stop the time entry").await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod credential_config_tests {
+    use super::ClockifyClient;
+    use std::{fs, path::PathBuf};
+    use uuid::Uuid;
+
+    fn temp_config() -> PathBuf {
+        std::env::temp_dir().join(format!("commitmentissues-config-{}.toml", Uuid::new_v4()))
+    }
+
+    fn write_private(path: &PathBuf, value: &str) {
+        fs::write(path, value).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    #[test]
+    fn absent_or_blank_config_keeps_local_only_mode() {
+        let path = temp_config();
+        assert!(ClockifyClient::from_config(&path).unwrap().is_none());
+        write_private(&path, "[clockify]\napi_key = \"  \"\n");
+        assert!(ClockifyClient::from_config(&path).unwrap().is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_api_key_from_toml() {
+        let path = temp_config();
+        write_private(&path, "[clockify]\napi_key = \"test-key\"\n");
+        assert!(ClockifyClient::from_config(&path).unwrap().is_some());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_toml_without_revealing_contents() {
+        let path = temp_config();
+        write_private(&path, "[clockify\napi_key = \"secret-test-value\"");
+        let error = match ClockifyClient::from_config(&path) {
+            Ok(_) => panic!("malformed config unexpectedly loaded"),
+            Err(error) => error.to_string(),
+        };
+        assert!(!error.contains("secret-test-value"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_config_readable_by_group_or_others() {
+        let path = temp_config();
+        fs::write(&path, "[clockify]\napi_key = \"test-key\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ClockifyClient::from_config(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 }
 

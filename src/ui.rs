@@ -370,10 +370,11 @@ impl Ui {
                 self.data.clockify_sync.insert(
                     session_id,
                     ClockifySync::FailedComplete {
-                        error: "CLOCKIFY_API_KEY is not set".into(),
+                        error: "API key is missing from config.toml".into(),
                     },
                 );
-                self.status = clockify_failure_prompt("save", "CLOCKIFY_API_KEY is not set");
+                self.status =
+                    clockify_failure_prompt("save", "API key is missing from config.toml");
             }
             ClockifySync::Running { entry_id } => {
                 self.data.clockify_sync.insert(
@@ -395,10 +396,11 @@ impl Ui {
                         session_id,
                         ClockifySync::FailedStop {
                             entry_id,
-                            error: "CLOCKIFY_API_KEY is not set".into(),
+                            error: "API key is missing from config.toml".into(),
                         },
                     );
-                    self.status = clockify_failure_prompt("stop", "CLOCKIFY_API_KEY is not set");
+                    self.status =
+                        clockify_failure_prompt("stop", "API key is missing from config.toml");
                 }
             }
             ClockifySync::LocalOnly if self.clockify.is_some() => {
@@ -425,7 +427,8 @@ impl Ui {
                     self.data
                         .clockify_sync
                         .insert(session_id, ClockifySync::FailedComplete { error });
-                    self.status = clockify_failure_prompt("start", "CLOCKIFY_API_KEY is not set");
+                    self.status =
+                        clockify_failure_prompt("start", "API key is missing from config.toml");
                 }
             }
             ClockifySync::FailedStop { entry_id, error } => {
@@ -482,7 +485,7 @@ impl Ui {
     fn open_clockify_config(&mut self) {
         if self.clockify.is_none() {
             self.status =
-                "Set CLOCKIFY_API_KEY in your shell and restart to configure Clockify".into();
+                "Add [clockify].api_key to config.toml, then restart to configure Clockify".into();
             return;
         }
         self.clockify_menu = true;
@@ -512,7 +515,8 @@ impl Ui {
             return;
         };
         let Some(client) = self.clockify.clone() else {
-            self.status = "Set CLOCKIFY_API_KEY and restart before mapping tasks".into();
+            self.status =
+                "Add [clockify].api_key to config.toml and restart before mapping tasks".into();
             return;
         };
         self.selected = task_index;
@@ -854,7 +858,7 @@ impl Ui {
     pub(crate) fn retry_clockify(&mut self) {
         if self.clockify.is_none() {
             self.status =
-                "Clockify retry needs CLOCKIFY_API_KEY; set it in your shell and restart the app"
+                "Clockify retry needs [clockify].api_key in config.toml; add it and restart the app"
                     .into();
             return;
         }

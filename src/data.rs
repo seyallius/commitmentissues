@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
@@ -39,6 +39,35 @@ pub(crate) struct Session {
     pub(crate) commits: Vec<Commit>,
 }
 
+/// Tracks remote delivery separately so local session records stay compatible.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ClockifySync {
+    #[default]
+    LocalOnly,
+    PendingStart,
+    Running {
+        entry_id: String,
+    },
+    PendingStop {
+        entry_id: Option<String>,
+    },
+    PendingComplete,
+    FailedStart {
+        error: String,
+    },
+    FailedStop {
+        entry_id: String,
+        error: String,
+    },
+    FailedComplete {
+        error: String,
+    },
+    Synced {
+        entry_id: String,
+    },
+}
+
 #[derive(Default)]
 pub(crate) struct Settings {
     pub(crate) repository_path: String,
@@ -50,6 +79,7 @@ pub(crate) struct Settings {
 pub(crate) struct AppData {
     pub(crate) tasks: Vec<Task>,
     pub(crate) sessions: Vec<Session>,
+    pub(crate) clockify_sync: BTreeMap<String, ClockifySync>,
     pub(crate) settings: Settings,
 }
 
@@ -59,12 +89,22 @@ impl AppData {
             .with_context(|| format!("create data directory {}", root.display()))?;
         let tasks_doc: Option<Versioned<TaskDoc>> = read_json(root.join("tasks.json"))?;
         let settings_doc: Option<Versioned<SettingsDoc>> = read_json(root.join("settings.json"))?;
+        let clockify_doc: Option<Versioned<ClockifyDoc>> = read_json(root.join("clockify.json"))?;
+        let clockify_sync = match clockify_doc {
+            Some(document) if document.version == 1 => document.data.states,
+            Some(document) => bail!(
+                "unsupported clockify.json version {}; preserve the file and update the app",
+                document.version
+            ),
+            None => BTreeMap::new(),
+        };
         let sessions = read_sessions(&root.join("sessions.tsv"))?;
         let mut data = Self {
             tasks: tasks_doc
                 .and_then(|document| document.map(|data| data.tasks))
                 .unwrap_or_default(),
             sessions,
+            clockify_sync,
             settings: settings_doc
                 .and_then(|document| document.map(|data| data))
                 .map(|d| Settings {
@@ -92,6 +132,15 @@ impl AppData {
                 );
             }
         }
+        for session_id in data.clockify_sync.keys() {
+            if !data
+                .sessions
+                .iter()
+                .any(|session| &session.id == session_id)
+            {
+                bail!("clockify.json references missing session {session_id}");
+            }
+        }
         Ok(data)
     }
 
@@ -117,6 +166,15 @@ impl AppData {
             })?,
         )?;
         write_sessions(&root.join("sessions.tsv"), &self.sessions)?;
+        atomic_write(
+            root.join("clockify.json"),
+            &serde_json::to_vec_pretty(&Versioned {
+                version: 1,
+                data: ClockifyDoc {
+                    states: self.clockify_sync.clone(),
+                },
+            })?,
+        )?;
         Ok(())
     }
 
@@ -191,6 +249,12 @@ struct SettingsDoc {
     export_directory: String,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct ClockifyDoc {
+    #[serde(default)]
+    states: BTreeMap<String, ClockifySync>,
+}
+
 impl<T> Versioned<T> {
     fn map<U>(self, f: impl FnOnce(T) -> U) -> Option<U> {
         if self.version == 1 {
@@ -198,6 +262,57 @@ impl<T> Versioned<T> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn clockify_delivery_state_round_trips_without_changing_session_tsv() {
+        let root = std::env::temp_dir().join(format!("commitmentissues-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let now = Local.with_ymd_and_hms(2026, 10, 27, 9, 30, 0).unwrap();
+        let task = Task {
+            id: "task-1".into(),
+            name: "Write tests".into(),
+            short_id: String::new(),
+            archived: false,
+        };
+        let session = Session {
+            id: "session-1".into(),
+            task_id: task.id.clone(),
+            started_at: now,
+            stopped_at: None,
+            duration_override_ns: None,
+            corrected: false,
+            commits: Vec::new(),
+        };
+        let mut data = AppData {
+            tasks: vec![task],
+            sessions: vec![session],
+            ..AppData::default()
+        };
+        data.clockify_sync.insert(
+            "session-1".into(),
+            ClockifySync::Running {
+                entry_id: "clockify-entry-1".into(),
+            },
+        );
+        data.save(&root).unwrap();
+
+        let loaded = AppData::load(&root).unwrap();
+        assert_eq!(
+            loaded.clockify_sync.get("session-1"),
+            Some(&ClockifySync::Running {
+                entry_id: "clockify-entry-1".into(),
+            })
+        );
+        let sessions_tsv = fs::read_to_string(root.join("sessions.tsv")).unwrap();
+        assert_eq!(sessions_tsv.lines().next().unwrap().split('\t').count(), 9);
+        let _ = fs::remove_dir_all(root);
     }
 }
 

@@ -1,4 +1,5 @@
 mod app;
+mod clockify;
 mod data;
 mod git;
 mod ui;

@@ -1,4 +1,5 @@
 use crate::{
+    clockify::ClockifyClient,
     data::AppData,
     ui::{Ui, handle_key, render},
 };
@@ -16,6 +17,7 @@ use ratatui::{
     layout::{Position, Rect},
 };
 use std::{io, path::PathBuf, time::Duration};
+use tokio::sync::mpsc;
 use tokio::time::{Instant, interval, interval_at};
 
 pub(crate) async fn run() -> Result<()> {
@@ -40,6 +42,21 @@ fn parse_data_dir() -> Result<PathBuf> {
 
 async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
     let theme = Ui::load_theme(&root);
+    let (clockify, clockify_status) = match ClockifyClient::from_env() {
+        Ok(Some(client)) => (
+            Some(client),
+            "Ready · Clockify configured; local records remain authoritative".to_owned(),
+        ),
+        Ok(None) => (
+            None,
+            "Ready · local tracking; set CLOCKIFY_API_KEY to enable Clockify".to_owned(),
+        ),
+        Err(error) => (
+            None,
+            format!("Clockify unavailable; local tracking continues: {error:#}"),
+        ),
+    };
+    let (clockify_sender, mut clockify_results) = mpsc::unbounded_channel();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -54,7 +71,7 @@ async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
         root,
         selected: 0,
         day: Local::now().date_naive(),
-        status: "Ready · click a task action or press ? for help".into(),
+        status: clockify_status,
         show_archived: false,
         input: None,
         task_area: Rect::default(),
@@ -68,8 +85,11 @@ async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
         context_menu: None,
         last_row_click: None,
         delete_confirmation: None,
+        clockify,
+        clockify_sender,
     };
     ui.refresh_git();
+    ui.resume_clockify_sync();
     let mut events = EventStream::new();
     let mut ticker = interval(Duration::from_secs(1));
     let mut git_refresh = interval_at(
@@ -81,6 +101,7 @@ async fn run_ui(data: AppData, root: PathBuf) -> Result<()> {
         tokio::select! {
             _ = ticker.tick() => {},
             _ = git_refresh.tick() => ui.refresh_git(),
+            Some(result) = clockify_results.recv() => ui.apply_clockify_result(result),
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => { if handle_key(&mut ui, key.code) { break Ok(()); } },
                 Some(Ok(Event::Mouse(mouse))) => match mouse.kind {

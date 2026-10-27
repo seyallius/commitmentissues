@@ -1,8 +1,9 @@
 use crate::{
-    data::{AppData, Commit, Task},
+    clockify::{ClockifyClient, SyncJob, SyncKind, SyncResult},
+    data::{AppData, ClockifySync, Commit, Task},
     git::{collect_commits, new_session},
 };
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use crossterm::event::{KeyCode, MouseButton};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
@@ -13,9 +14,10 @@ use ratatui::{
 use std::{
     collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 pub(crate) struct Ui {
@@ -37,6 +39,8 @@ pub(crate) struct Ui {
     pub(crate) context_menu: Option<(usize, u16, u16)>,
     pub(crate) last_row_click: Option<(usize, Instant)>,
     pub(crate) delete_confirmation: Option<usize>,
+    pub(crate) clockify: Option<ClockifyClient>,
+    pub(crate) clockify_sender: UnboundedSender<SyncResult>,
 }
 
 #[derive(Clone, Copy)]
@@ -158,6 +162,9 @@ impl Ui {
                     self.data
                         .sessions
                         .retain(|session| session.task_id != task_id);
+                    self.data.clockify_sync.retain(|session_id, _| {
+                        self.data.sessions.iter().any(|s| &s.id == session_id)
+                    });
                     self.data.tasks.remove(index);
                     self.selected = self.selected.min(self.data.tasks.len().saturating_sub(1));
                     self.persist();
@@ -219,7 +226,7 @@ impl Ui {
         self.selected = tasks[next].0;
     }
 
-    pub(crate) fn load_theme(root: &PathBuf) -> usize {
+    pub(crate) fn load_theme(root: &Path) -> usize {
         fs::read_to_string(root.join("theme.txt"))
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
@@ -268,61 +275,411 @@ impl Ui {
         if self.data.tasks[index].archived {
             self.data.tasks[index].archived = false;
             self.status = "Task restored".into();
+            self.persist();
             return;
         }
+        let mut jobs = Vec::new();
         if let Some(running) = self.data.running() {
             if self.data.sessions[running].task_id == self.data.tasks[index].id {
-                self.data.sessions[running].stopped_at = Some(now);
-                self.status = format!("Stopped {}", self.data.tasks[index].name);
-                let known: HashSet<String> = self
-                    .data
-                    .sessions
-                    .iter()
-                    .flat_map(|s| s.commits.iter().map(|c| c.hash.clone()))
-                    .collect();
-                match collect_commits(&self.data.settings, now.date_naive()) {
-                    Ok(commits) => {
-                        let fresh: Vec<_> = commits
-                            .into_iter()
-                            .filter(|c| !known.contains(&c.hash))
-                            .collect();
-                        self.data.sessions[running].commits.extend(fresh);
-                    }
-                    Err(error) => self.status.push_str(&format!(" · Git: {error}")),
+                self.stop_session(running, now, &mut jobs);
+                if self.status.is_empty() {
+                    self.status = format!("Stopped {}", self.data.tasks[index].name);
                 }
             } else {
-                self.data.sessions[running].stopped_at = Some(now);
-                let known: HashSet<String> = self
-                    .data
-                    .sessions
-                    .iter()
-                    .flat_map(|session| session.commits.iter().map(|commit| commit.hash.clone()))
-                    .collect();
-                if let Ok(commits) = collect_commits(&self.data.settings, now.date_naive()) {
-                    self.data.sessions[running].commits.extend(
-                        commits
-                            .into_iter()
-                            .filter(|commit| !known.contains(&commit.hash)),
-                    );
+                self.stop_session(running, now, &mut jobs);
+                self.start_session(index, now, &mut jobs);
+                if self.status.is_empty() {
+                    self.status = format!("Switched to {}", self.data.tasks[index].name);
                 }
-                self.data
-                    .sessions
-                    .push(new_session(&self.data.tasks[index], now));
-                self.status = format!("Switched to {}", self.data.tasks[index].name);
             }
         } else {
-            self.data
-                .sessions
-                .push(new_session(&self.data.tasks[index], now));
+            self.start_session(index, now, &mut jobs);
             self.status = format!("Started {}", self.data.tasks[index].name);
         }
-        self.persist();
-    }
-    pub(crate) fn persist(&mut self) {
-        if let Err(e) = self.data.save(&self.root) {
-            self.status = format!("Save failed: {e:#}");
+        if self.persist() {
+            for job in jobs {
+                self.dispatch_sync(job);
+            }
         }
     }
+    fn start_session(&mut self, task_index: usize, now: DateTime<Local>, jobs: &mut Vec<SyncJob>) {
+        let session = new_session(&self.data.tasks[task_index], now);
+        if self.clockify.is_some() {
+            self.data
+                .clockify_sync
+                .insert(session.id.clone(), ClockifySync::PendingStart);
+            jobs.push(SyncJob::start(
+                session.id.clone(),
+                session.started_at,
+                self.data.tasks[task_index].name.clone(),
+            ));
+        }
+        self.data.sessions.push(session);
+    }
+
+    fn stop_session(
+        &mut self,
+        session_index: usize,
+        now: DateTime<Local>,
+        jobs: &mut Vec<SyncJob>,
+    ) {
+        self.status.clear();
+        let session_id = self.data.sessions[session_index].id.clone();
+        let task_id = self.data.sessions[session_index].task_id.clone();
+        let started_at = self.data.sessions[session_index].started_at;
+        let task_name = self.data.task_name(&task_id).to_owned();
+        self.data.sessions[session_index].stopped_at = Some(now);
+        let known: HashSet<String> = self
+            .data
+            .sessions
+            .iter()
+            .flat_map(|session| session.commits.iter().map(|commit| commit.hash.clone()))
+            .collect();
+        match collect_commits(&self.data.settings, now.date_naive()) {
+            Ok(commits) => self.data.sessions[session_index].commits.extend(
+                commits
+                    .into_iter()
+                    .filter(|commit| !known.contains(&commit.hash)),
+            ),
+            Err(error) => self.status.push_str(&format!(" · Git: {error}")),
+        }
+
+        let sync = self
+            .data
+            .clockify_sync
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        match sync {
+            ClockifySync::PendingStart if self.clockify.is_some() => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id, ClockifySync::PendingStop { entry_id: None });
+            }
+            ClockifySync::PendingStart => {
+                self.data.clockify_sync.insert(
+                    session_id,
+                    ClockifySync::FailedComplete {
+                        error: "CLOCKIFY_API_KEY is not set".into(),
+                    },
+                );
+                self.status = clockify_failure_prompt("save", "CLOCKIFY_API_KEY is not set");
+            }
+            ClockifySync::Running { entry_id } => {
+                self.data.clockify_sync.insert(
+                    session_id.clone(),
+                    ClockifySync::PendingStop {
+                        entry_id: Some(entry_id.clone()),
+                    },
+                );
+                if self.clockify.is_some() {
+                    jobs.push(SyncJob::stop(
+                        session_id, entry_id, started_at, now, task_name,
+                    ));
+                } else {
+                    self.data.clockify_sync.insert(
+                        session_id,
+                        ClockifySync::FailedStop {
+                            entry_id,
+                            error: "CLOCKIFY_API_KEY is not set".into(),
+                        },
+                    );
+                    self.status = clockify_failure_prompt("stop", "CLOCKIFY_API_KEY is not set");
+                }
+            }
+            ClockifySync::LocalOnly if self.clockify.is_some() => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id.clone(), ClockifySync::PendingComplete);
+                jobs.push(SyncJob::complete(session_id, started_at, now, task_name));
+            }
+            ClockifySync::LocalOnly => {}
+            ClockifySync::FailedStart { error } => {
+                if self.clockify.is_some() {
+                    self.data
+                        .clockify_sync
+                        .insert(session_id.clone(), ClockifySync::PendingComplete);
+                    jobs.push(SyncJob::complete(session_id, started_at, now, task_name));
+                    self.status = format!(
+                        "Clockify start failed ({error}); retrying as a completed local interval…"
+                    );
+                } else {
+                    self.data
+                        .clockify_sync
+                        .insert(session_id, ClockifySync::FailedComplete { error });
+                    self.status = clockify_failure_prompt("start", "CLOCKIFY_API_KEY is not set");
+                }
+            }
+            ClockifySync::FailedStop { entry_id, error } => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id, ClockifySync::FailedStop { entry_id, error });
+                self.status = clockify_failure_prompt("stop", "the locally recorded session");
+            }
+            ClockifySync::FailedComplete { error } => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id, ClockifySync::FailedComplete { error });
+                self.status = clockify_failure_prompt("save", "the locally recorded session");
+            }
+            ClockifySync::PendingStop { entry_id } => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id, ClockifySync::PendingStop { entry_id });
+            }
+            ClockifySync::PendingComplete => {}
+            ClockifySync::Synced { entry_id } => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id, ClockifySync::Synced { entry_id });
+            }
+        }
+    }
+
+    fn dispatch_sync(&self, job: SyncJob) {
+        let Some(client) = self.clockify.clone() else {
+            return;
+        };
+        let sender = self.clockify_sender.clone();
+        tokio::spawn(async move {
+            let result = client.execute(job).await;
+            let _ = sender.send(result);
+        });
+    }
+
+    pub(crate) fn resume_clockify_sync(&mut self) {
+        let mut jobs = Vec::new();
+        for session in &self.data.sessions {
+            let Some(stopped_at) = session.stopped_at else {
+                if let Some(ClockifySync::PendingStart) = self.data.clockify_sync.get(&session.id) {
+                    jobs.push(SyncJob::start(
+                        session.id.clone(),
+                        session.started_at,
+                        self.data.task_name(&session.task_id).to_owned(),
+                    ));
+                }
+                continue;
+            };
+            let Some(sync) = self.data.clockify_sync.get(&session.id) else {
+                continue;
+            };
+            match sync {
+                ClockifySync::PendingStop {
+                    entry_id: Some(entry_id),
+                } => jobs.push(SyncJob::stop(
+                    session.id.clone(),
+                    entry_id.clone(),
+                    session.started_at,
+                    stopped_at,
+                    self.data.task_name(&session.task_id).to_owned(),
+                )),
+                ClockifySync::PendingStop { entry_id: None } | ClockifySync::PendingComplete => {
+                    jobs.push(SyncJob::complete(
+                        session.id.clone(),
+                        session.started_at,
+                        stopped_at,
+                        self.data.task_name(&session.task_id).to_owned(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        for job in jobs {
+            self.dispatch_sync(job);
+        }
+    }
+
+    pub(crate) fn apply_clockify_result(&mut self, result: SyncResult) {
+        let Some(session_index) = self
+            .data
+            .sessions
+            .iter()
+            .position(|session| session.id == result.session_id)
+        else {
+            return;
+        };
+        let session = &self.data.sessions[session_index];
+        let task_name = self.data.task_name(&session.task_id).to_owned();
+        let started_at = session.started_at;
+        let stopped_at = session.stopped_at;
+        let mut follow_up = None;
+        match (result.kind, result.error) {
+            (SyncKind::Start, None) => {
+                let Some(entry_id) = result.entry_id else {
+                    return;
+                };
+                if let Some(stopped_at) = stopped_at {
+                    self.data.clockify_sync.insert(
+                        result.session_id.clone(),
+                        ClockifySync::PendingStop {
+                            entry_id: Some(entry_id.clone()),
+                        },
+                    );
+                    follow_up = Some(SyncJob::stop(
+                        result.session_id,
+                        entry_id,
+                        started_at,
+                        stopped_at,
+                        task_name,
+                    ));
+                    self.status = "Clockify timer started and stopped; saving its end time…".into();
+                } else {
+                    self.data
+                        .clockify_sync
+                        .insert(result.session_id, ClockifySync::Running { entry_id });
+                    self.status = "Clockify timer started".into();
+                }
+            }
+            (SyncKind::Start, Some(error)) => {
+                let state = if stopped_at.is_some() {
+                    follow_up = Some(SyncJob::complete(
+                        result.session_id.clone(),
+                        started_at,
+                        stopped_at.unwrap_or_else(Local::now),
+                        task_name,
+                    ));
+                    ClockifySync::PendingComplete
+                } else {
+                    ClockifySync::FailedStart {
+                        error: error.clone(),
+                    }
+                };
+                self.data.clockify_sync.insert(result.session_id, state);
+                self.status = if stopped_at.is_some() {
+                    format!(
+                        "Clockify start failed ({error}); retrying as a completed local interval…"
+                    )
+                } else {
+                    format!(
+                        "Clockify start failed: {error}. Local timer is running; stopping will retry the complete interval. If that fails, enter the interval manually in Clockify."
+                    )
+                };
+            }
+            (SyncKind::Stop, None) => {
+                if let Some(entry_id) = result.entry_id {
+                    self.data
+                        .clockify_sync
+                        .insert(result.session_id, ClockifySync::Synced { entry_id });
+                }
+                self.status = "Clockify timer saved".into();
+            }
+            (SyncKind::Stop, Some(error)) => {
+                let Some(entry_id) = result.entry_id else {
+                    return;
+                };
+                self.data.clockify_sync.insert(
+                    result.session_id,
+                    ClockifySync::FailedStop {
+                        entry_id,
+                        error: error.clone(),
+                    },
+                );
+                self.status = clockify_failure_prompt("stop", &error);
+            }
+            (SyncKind::Complete, None) => {
+                if let Some(entry_id) = result.entry_id {
+                    self.data
+                        .clockify_sync
+                        .insert(result.session_id, ClockifySync::Synced { entry_id });
+                }
+                self.status = "Clockify timer saved".into();
+            }
+            (SyncKind::Complete, Some(error)) => {
+                self.data.clockify_sync.insert(
+                    result.session_id,
+                    ClockifySync::FailedComplete {
+                        error: error.clone(),
+                    },
+                );
+                self.status = clockify_failure_prompt("save", &error);
+            }
+        }
+        if self.persist()
+            && let Some(job) = follow_up
+        {
+            self.dispatch_sync(job);
+        }
+    }
+
+    pub(crate) fn retry_clockify(&mut self) {
+        if self.clockify.is_none() {
+            self.status =
+                "Clockify retry needs CLOCKIFY_API_KEY; set it in your shell and restart the app"
+                    .into();
+            return;
+        }
+        let retry_index = self.data.sessions.iter().rposition(|session| {
+            matches!(
+                self.data
+                    .clockify_sync
+                    .get(&session.id)
+                    .unwrap_or(&ClockifySync::LocalOnly),
+                ClockifySync::LocalOnly
+                    | ClockifySync::FailedStart { .. }
+                    | ClockifySync::FailedStop { .. }
+                    | ClockifySync::FailedComplete { .. }
+            )
+        });
+        let Some(index) = retry_index else {
+            self.status = "No failed or local-only session is available to retry".into();
+            return;
+        };
+        let session = &self.data.sessions[index];
+        let session_id = session.id.clone();
+        let started_at = session.started_at;
+        let stopped_at = session.stopped_at;
+        let task_name = self.data.task_name(&session.task_id).to_owned();
+        let previous = self
+            .data
+            .clockify_sync
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let job = match previous {
+            ClockifySync::FailedStop { entry_id, .. } if stopped_at.is_some() => {
+                let stopped_at = stopped_at.unwrap_or_else(Local::now);
+                self.data.clockify_sync.insert(
+                    session_id.clone(),
+                    ClockifySync::PendingStop {
+                        entry_id: Some(entry_id.clone()),
+                    },
+                );
+                SyncJob::stop(session_id, entry_id, started_at, stopped_at, task_name)
+            }
+            _ if stopped_at.is_some() => {
+                let stopped_at = stopped_at.unwrap_or_else(Local::now);
+                self.data
+                    .clockify_sync
+                    .insert(session_id.clone(), ClockifySync::PendingComplete);
+                SyncJob::complete(session_id, started_at, stopped_at, task_name)
+            }
+            _ => {
+                self.data
+                    .clockify_sync
+                    .insert(session_id.clone(), ClockifySync::PendingStart);
+                SyncJob::start(session_id, started_at, task_name)
+            }
+        };
+        if self.persist() {
+            self.status = "Retrying Clockify sync…".into();
+            self.dispatch_sync(job);
+        }
+    }
+
+    pub(crate) fn persist(&mut self) -> bool {
+        if let Err(e) = self.data.save(&self.root) {
+            self.status = format!("Save failed: {e:#}");
+            false
+        } else {
+            true
+        }
+    }
+}
+
+fn clockify_failure_prompt(operation: &str, detail: &str) -> String {
+    format!(
+        "Clockify {operation} failed ({detail}). Local time is saved. Enter the full start-to-stop interval manually in Clockify; press c to retry sync if you prefer."
+    )
 }
 
 pub(crate) fn handle_key(ui: &mut Ui, key: KeyCode) -> bool {
@@ -376,6 +733,7 @@ pub(crate) fn handle_key(ui: &mut Ui, key: KeyCode) -> bool {
         KeyCode::Up | KeyCode::Char('k') => ui.step_selection(-1),
         KeyCode::Enter | KeyCode::Char(' ') => ui.activate(ui.selected),
         KeyCode::Char('n') => ui.input = Some(("New task".into(), String::new())),
+        KeyCode::Char('c') => ui.retry_clockify(),
         KeyCode::Char('r') if ui.selected < ui.data.tasks.len() => {
             ui.input = Some((
                 "Rename task".into(),
@@ -1161,6 +1519,10 @@ fn render_help(frame: &mut ratatui::Frame, ui: &mut Ui, colors: Palette) {
             Span::raw("        Cycle themes or select one directly"),
         ]),
         Line::from(vec![
+            Span::styled("c", Style::default().fg(colors.accent)),
+            Span::raw("             Retry the latest local or failed Clockify session"),
+        ]),
+        Line::from(vec![
             Span::styled("? / F1 / Esc", Style::default().fg(colors.accent)),
             Span::raw("  Close this help"),
         ]),
@@ -1351,5 +1713,115 @@ fn format_duration(duration: chrono::Duration) -> String {
         format!("{minutes}m {seconds:02}s")
     } else {
         format!("{}h {:02}m {:02}s", minutes / 60, minutes % 60, seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        clockify::{SyncKind, SyncResult},
+        data::{Session, Settings},
+    };
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn clockify_failure_keeps_local_time_and_retries_complete_interval_on_stop() {
+        let root = std::env::temp_dir().join(format!("commitmentissues-ui-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let task = Task {
+            id: "task-1".into(),
+            name: "Write tests".into(),
+            short_id: String::new(),
+            archived: false,
+        };
+        let session = Session {
+            id: "session-1".into(),
+            task_id: task.id.clone(),
+            started_at: Local::now() - chrono::Duration::minutes(5),
+            stopped_at: None,
+            duration_override_ns: None,
+            corrected: false,
+            commits: Vec::new(),
+        };
+        let (clockify_sender, _) = mpsc::unbounded_channel();
+        let mut ui = Ui {
+            data: AppData {
+                tasks: vec![task],
+                sessions: vec![session],
+                clockify_sync: [("session-1".into(), ClockifySync::PendingStart)]
+                    .into_iter()
+                    .collect(),
+                settings: Settings {
+                    repository_path: root.display().to_string(),
+                    ..Settings::default()
+                },
+            },
+            root: root.clone(),
+            selected: 0,
+            day: Local::now().date_naive(),
+            status: String::new(),
+            show_archived: false,
+            input: None,
+            task_area: Rect::default(),
+            button_areas: Vec::new(),
+            task_rows: Vec::new(),
+            theme: 4,
+            show_help: false,
+            git_commits: Vec::new(),
+            git_status: String::new(),
+            click_targets: Vec::new(),
+            context_menu: None,
+            last_row_click: None,
+            delete_confirmation: None,
+            clockify: None,
+            clockify_sender,
+        };
+
+        ui.apply_clockify_result(SyncResult {
+            session_id: "session-1".into(),
+            kind: SyncKind::Start,
+            entry_id: None,
+            error: Some("Clockify returned HTTP 401".into()),
+        });
+        assert!(ui.data.running().is_some());
+        assert!(ui.status.contains("timer is running"));
+
+        ui.activate(0);
+        assert!(ui.data.running().is_none());
+        assert!(ui.data.sessions[0].stopped_at.is_some());
+        assert!(matches!(
+            ui.data.clockify_sync.get("session-1"),
+            Some(ClockifySync::FailedComplete { .. })
+        ));
+        assert!(ui.status.contains("press c to retry"));
+
+        let next_session = new_session(
+            &ui.data.tasks[0],
+            Local::now() - chrono::Duration::minutes(2),
+        );
+        let next_session_id = next_session.id.clone();
+        ui.data.sessions.push(next_session);
+        ui.data.clockify_sync.insert(
+            next_session_id.clone(),
+            ClockifySync::FailedStart {
+                error: "HTTP 503".into(),
+            },
+        );
+        ui.clockify = Some(ClockifyClient::for_test(
+            "test-secret",
+            "http://127.0.0.1:1/api/v1".into(),
+        ));
+        let stopped_at = Local::now();
+        let mut jobs = Vec::new();
+        ui.stop_session(1, stopped_at, &mut jobs);
+        assert!(matches!(
+            ui.data.clockify_sync.get(&next_session_id),
+            Some(ClockifySync::PendingComplete)
+        ));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, SyncKind::Complete);
+        assert_eq!(jobs[0].stopped_at, Some(stopped_at));
+        let _ = fs::remove_dir_all(root);
     }
 }
